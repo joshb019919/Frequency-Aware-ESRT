@@ -11,8 +11,8 @@ def default_conv(in_channels, out_channels, kernel_size, bias=True, groups = 1):
     return nn.Conv2d(
         in_channels, out_channels, kernel_size,
         padding=(kernel_size//2), bias=bias, groups = groups)
-class Scale(nn.Module):
 
+class Scale(nn.Module):
     def __init__(self, init_value=1e-3):
         super().__init__()
         self.scale = nn.Parameter(torch.FloatTensor([init_value]))
@@ -31,22 +31,19 @@ class MeanShift(nn.Conv2d):
         self.requires_grad = False
 
 class BasicBlock(nn.Sequential):
-    def __init__(
-        self, in_channels, out_channels, kernel_size, stride=1, bias=False,
-        bn=True, act=nn.ReLU(True)):
+    def __init__(self, in_channels, out_channels, 
+                 kernel_size, stride=1, bias=False,
+                 bn=True, act=nn.ReLU(True)):
 
-        m = [nn.Conv2d(
-            in_channels, out_channels, kernel_size,
-            padding=(kernel_size//2), stride=stride, bias=bias)
-        ]
+        m = [nn.Conv2d(in_channels, out_channels, kernel_size,
+                       padding=(kernel_size//2), stride=stride, bias=bias)]
         if bn: m.append(nn.BatchNorm2d(out_channels))
         if act is not None: m.append(act)
         super(BasicBlock, self).__init__(*m)
 
 class ResBlock(nn.Module):
-    def __init__(
-        self, conv, n_feats, kernel_size,
-        bias=True, bn=False, act=nn.ReLU(True), res_scale=1):
+    def __init__(self, conv, n_feats, kernel_size,
+                 bias=True, bn=False, act=nn.ReLU(True), res_scale=1):
 
         super(ResBlock, self).__init__()
         m = []
@@ -65,9 +62,8 @@ class ResBlock(nn.Module):
         return res
 
 class LuConv(nn.Module):
-    def __init__(
-        self, conv, n_feats, kernel_size,
-        bias=True, bn=False, act=nn.LeakyReLU(0.05), res_scale=1):
+    def __init__(self, conv, n_feats, kernel_size,
+                 bias=True, bn=False, act=nn.LeakyReLU(0.05), res_scale=1):
         super(LuConv, self).__init__()
         #self.scale1 = Scale(1)
         #self.scale2 = Scale(1)
