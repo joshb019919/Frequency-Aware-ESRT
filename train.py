@@ -1,3 +1,15 @@
+"""Train ESRT for single-image super-resolution.
+
+Role in ESRT: the training entry point. It wires together the data pipeline
+(data/), the network (model/esrt.py) and the helpers in utils.py.
+
+Script-style entry point (runs on import): parses CLI args, builds the DIV2K
+training loader and Set5 validation loader, trains with L1 loss + Adam and a
+step-decay LR schedule, validates (Y-channel PSNR/SSIM) every epoch and saves a
+checkpoint every 10 epochs to experiment/checkpoint_ESRT_x<scale>/.
+
+Usually launched through main.py:  python main.py --train --hf_repo USER/DIV2K
+"""
 import argparse, os
 import torch
 import torch.nn as nn
@@ -25,6 +37,8 @@ parser.add_argument("--lr", type=float, default=2e-4,
                     help="Learning Rate. Default=2e-4")
 parser.add_argument("--step_size", type=int, default=200,
                     help="learning rate decay per N epochs")
+# NOTE: declared type=int but the default is a float; a value passed on the CLI
+# would be parsed as int, so fractional decay factors can't be given on the command line.
 parser.add_argument("--gamma", type=int, default=0.5,
                     help="learning rate decay factor for step decay")
 parser.add_argument("--cuda", action="store_true", default=True,
@@ -41,7 +55,7 @@ parser.add_argument("--n_train", type=int, default=800,
                     help="number of training set")
 parser.add_argument("--n_val", type=int, default=1,
                     help="number of validation set")
-parser.add_argument("--test_every", type=int, default=1000)
+parser.add_argument("--test_every", type=int, default=1000)  # only used by RealSR.py to size an epoch
 parser.add_argument("--scale", type=int, default=2,
                     help="super-resolution scale")
 parser.add_argument("--patch_size", type=int, default=192,
@@ -53,14 +67,14 @@ parser.add_argument("--n_colors", type=int, default=3,
 parser.add_argument("--pretrained", default="", type=str,
                     help="path to pretrained models")
 parser.add_argument("--seed", type=int, default=1)
-parser.add_argument("--isY", action="store_true", default=True)
-parser.add_argument("--ext", type=str, default='.npy')
+parser.add_argument("--isY", action="store_true", default=True)  # evaluate PSNR/SSIM on the Y channel
+parser.add_argument("--ext", type=str, default='.npy')  # training image format: '.npy' (pre-decoded) or '.png'
 parser.add_argument("--phase", type=str, default='train')
-parser.add_argument("--model", type=str, default='ESRT')
+parser.add_argument("--model", type=str, default='ESRT')  # currently unused; ESRT is hard-coded below
 
 args = parser.parse_args()
 print(args)
-torch.backends.cudnn.benchmark = True
+torch.backends.cudnn.benchmark = True  # autotune conv algorithms (fixed-size training patches)
 # random seed
 seed = args.seed
 if seed is None:
@@ -74,6 +88,8 @@ device = torch.device('cuda' if cuda else 'cpu')
 
 print("===> Loading datasets")
 
+# Training: random HR/LR patch pairs from DIV2K (see data/DIV2K.py).
+# Validation: full Set5 images, paths relative to the working directory.
 trainset = DIV2K.div2k(args)
 testset = Set5_val.DatasetFromFolderVal("Test_Datasets/Set5/",
                                        "Test_Datasets/Set5_LR/x{}/".format(args.scale),
@@ -95,6 +111,7 @@ if cuda:
     model = model.to(device)
     l1_criterion = l1_criterion.to(device)
 
+# Optionally initialise from a checkpoint (supports DataParallel 'module.' prefixes).
 if args.pretrained:
 
     if os.path.isfile(args.pretrained):
@@ -103,11 +120,13 @@ if args.pretrained:
         new_state_dcit = OrderedDict()
         for k, v in checkpoint.items():
             if 'module' in k:
-                name = k[7:]
+                name = k[7:]  # strip the leading 'module.' added by nn.DataParallel
             else:
                 name = k
             new_state_dcit[name] = v
         model_dict = model.state_dict()
+        # Keep only keys that exist in the current model, and list any model
+        # parameters the checkpoint does not provide.
         pretrained_dict = {k: v for k, v in new_state_dcit.items() if k in model_dict}
 
         for k, v in model_dict.items():
@@ -124,6 +143,11 @@ optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
 
 def train(epoch):
+    """Run one training epoch over `training_data_loader`.
+
+    Applies the step-decay LR schedule for `epoch`, then optimises the L1 loss
+    between the model output and the HR patch, logging every 100 iterations.
+    """
     model.train()
     utils.adjust_learning_rate(optimizer, epoch, args.step_size, args.lr, args.gamma)
     print('epoch =', epoch, 'lr = ', optimizer.param_groups[0]['lr'])
@@ -144,11 +168,27 @@ def train(epoch):
             print("===> Epoch[{}]({}/{}): Loss_l1: {:.5f}".format(epoch, iteration, len(training_data_loader),
                                                                   loss_l1.item()))
 def forward_chop(model, x, scale, shave=10, min_size=60000):
-    # scale = scale#self.scale[self.idx_scale]
-    n_GPUs = 1#min(self.n_GPUs, 4)
+    """Memory-saving inference: split the LR image into 4 overlapping quadrants.
+
+    Each quadrant (half size + `shave` px of overlap) is super-resolved and the
+    results are stitched back, discarding the overlap borders. Quadrants whose
+    area is >= `min_size` pixels are split recursively.
+
+    Args:
+        model: SR network mapping (B, C, h, w) -> (B, C, scale*h, scale*w).
+        x: LR input tensor (B, C, H, W).
+        scale: upscaling factor.
+        shave: overlap (LR pixels) between quadrants to hide border artefacts.
+        min_size: pixel-area threshold below which a quadrant is run directly.
+
+    Returns:
+        SR tensor (B, C, scale*H, scale*W).
+    """
+    n_GPUs = 1  # leftover from the multi-GPU EDSR/RCAN version; chunks run one at a time
     b, c, h, w = x.size()
     h_half, w_half = h // 2, w // 2
     h_size, w_size = h_half + shave, w_half + shave
+    # Four corner crops: top-left, top-right, bottom-left, bottom-right.
     lr_list = [
         x[:, :, 0:h_size, 0:w_size],
         x[:, :, 0:h_size, (w - w_size):w],
@@ -162,16 +202,21 @@ def forward_chop(model, x, scale, shave=10, min_size=60000):
             sr_batch = model(lr_batch)
             sr_list.extend(sr_batch.chunk(n_GPUs, dim=0))
     else:
+        # NOTE: `scale` is not forwarded to the recursive call, so it would hit
+        # a missing-argument TypeError if recursion were ever reached
+        # (it isn't for the small Set5 images used here).
         sr_list = [
             forward_chop(model, patch, shave=shave, min_size=min_size) \
             for patch in lr_list
         ]
 
+    # Convert all sizes to the HR domain.
     h, w = scale * h, scale * w
     h_half, w_half = scale * h_half, scale * w_half
     h_size, w_size = scale * h_size, scale * w_size
     shave *= scale
 
+    # Paste the non-overlapping part of each SR quadrant into the output canvas.
     output = x.new(b, c, h, w)
     output[:, :, 0:h_half, 0:w_half] \
         = sr_list[0][:, :, 0:h_half, 0:w_half]
@@ -185,6 +230,11 @@ def forward_chop(model, x, scale, shave=10, min_size=60000):
     return output
 
 def valid(scale):
+    """Evaluate on the validation set and print mean PSNR / SSIM.
+
+    Images are super-resolved with forward_chop, shaved by `scale` border
+    pixels, and (if --isY) compared on the quantised Y channel of YCbCr.
+    """
     model.eval()
 
     avg_psnr, avg_ssim = 0, 0
@@ -216,6 +266,7 @@ def valid(scale):
 
 
 def save_checkpoint(epoch):
+    """Save the model weights to experiment/checkpoint_ESRT_x<scale>/epoch_<epoch>.pth."""
     model_folder = "experiment/checkpoint_ESRT_x{}/".format(args.scale)
     model_out_path = model_folder + "epoch_{}.pth".format(epoch)
     if not os.path.exists(model_folder):
@@ -224,6 +275,7 @@ def save_checkpoint(epoch):
     print("===> Checkpoint saved to {}".format(model_out_path))
 
 def print_network(net):
+    """Print the total number of parameters in `net`."""
     num_params = 0
     for param in net.parameters():
         num_params += param.numel()
@@ -234,6 +286,8 @@ print("===> Training")
 print_network(model)
 code_start = datetime.datetime.now()
 timer = utils.Timer()
+# Main loop. Note validation runs *before* training each epoch, so the reported
+# score lags the weights saved at the end of that epoch by one epoch.
 for epoch in range(args.start_epoch, args.nEpochs + 1):
     t_epoch_start = timer.t()
     epoch_start = datetime.datetime.now()
@@ -244,7 +298,9 @@ for epoch in range(args.start_epoch, args.nEpochs + 1):
     epoch_end = datetime.datetime.now()
     print('Epoch cost times: %s' % str(epoch_end-epoch_start))
     t = timer.t()
+    # Fraction of training done -> used to extrapolate total run time (ETA).
     prog = (epoch-args.start_epoch+1)/(args.nEpochs + 1 - args.start_epoch + 1)
+    # Print: this epoch's time, total elapsed, projected total.
     t_epoch = utils.time_text(t - t_epoch_start)
     t_elapsed, t_all = utils.time_text(t), utils.time_text(t / prog)
     print('{} {}/{}'.format(t_epoch, t_elapsed, t_all))
