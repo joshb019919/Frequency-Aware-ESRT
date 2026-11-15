@@ -1,3 +1,9 @@
+"""Data-preparation helpers: random patch cropping, channel handling, tensor
+conversion and flip/rotate augmentation. All images are HxWxC numpy arrays.
+
+Role in ESRT: the low-level steps of the training data pipeline, shared by the
+DIV2K and RealSR dataset classes.
+"""
 import random
 import torch
 import numpy as np
@@ -5,11 +11,23 @@ import skimage.color as sc
 
 
 def get_patch(*args, patch_size, scale):
+    """Randomly crop an aligned LR/HR patch pair.
+
+    Args:
+        *args: (lr_img, hr_img, ...) HxWxC arrays; the first is the LR image,
+            the rest are HR-sized targets.
+        patch_size: HR patch size; the LR patch is patch_size // scale.
+        scale: SR factor relating LR and HR coordinates.
+
+    Returns:
+        List [lr_patch, hr_patch, ...] cropped at corresponding locations.
+    """
     ih, iw = args[0].shape[:2]
 
     tp = patch_size  # target patch (HR)
     ip = tp // scale  # input patch (LR)
 
+    # Random top-left corner in LR space; the HR corner is the same point * scale.
     ix = random.randrange(0, iw - ip + 1)
     iy = random.randrange(0, ih - ip + 1)
     tx, ty = scale * ix, scale * iy
@@ -22,6 +40,11 @@ def get_patch(*args, patch_size, scale):
 
 
 def set_channel(*args, n_channels=3):
+    """Force every image to `n_channels` channels.
+
+    Grayscale -> replicated to 3 channels; RGB -> Y channel of YCbCr when
+    n_channels == 1. Returns a list of HxWxC arrays.
+    """
     def _set_channel(img):
         if img.ndim == 2:
             img = np.expand_dims(img, axis=2)
@@ -38,6 +61,7 @@ def set_channel(*args, n_channels=3):
 
 
 def np2Tensor(*args, rgb_range):
+    """Convert HxWxC uint8 arrays to CxHxW float tensors scaled to [0, rgb_range]."""
     def _np2Tensor(img):
         np_transpose = np.ascontiguousarray(img.transpose((2, 0, 1)))
         tensor = torch.from_numpy(np_transpose).float()
@@ -49,6 +73,11 @@ def np2Tensor(*args, rgb_range):
 
 
 def augment(*args, hflip=True, rot=True):
+    """Apply the same random flip/rotation to all images (keeps LR/HR aligned).
+
+    Draws one horizontal flip, one vertical flip and one 90-degree rotation
+    (done as a transpose) with probability 0.5 each, shared across `args`.
+    """
     hflip = hflip and random.random() < 0.5
     vflip = rot and random.random() < 0.5
     rot90 = rot and random.random() < 0.5

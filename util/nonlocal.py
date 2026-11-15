@@ -1,9 +1,19 @@
+"""2D-only variant of util/non.py (non-local self-attention blocks).
+
+Role in ESRT: none; an unused duplicate of util/non.py.
+
+The 1D/3D branches are commented out and Conv2d/MaxPool2d/BatchNorm2d are
+hard-coded, so NONLocalBlock1D/3D here would not work correctly. Prefer
+util/non.py; this copy is kept for reference and contains leftover pdb hooks.
+(The filename also shadows the `nonlocal` keyword, so it can't be imported with a normal import statement.)
+"""
 import torch
 from torch import nn
 from torch.nn import functional as F
 import pdb
 
 class _NonLocalBlockND(nn.Module):
+    """Base non-local block, hard-wired to 2D convolutions. See util/non.py for the documented generic version."""
     def __init__(self, in_channels, inter_channels=None, dimension=3, sub_sample=True, bn_layer=True):
         super(_NonLocalBlockND, self).__init__()
 
@@ -62,8 +72,8 @@ class _NonLocalBlockND(nn.Module):
 
     def forward(self, x):
         '''
-        :param x: (b, c, t, h, w)
-        :return:
+        :param x: (b, c, h, w) feature map
+        :return: tensor of the same shape as x
         '''
         # pdb.set_trace()
         batch_size = x.size(0)

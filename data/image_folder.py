@@ -1,3 +1,8 @@
+"""Generic image-folder dataset and file-scanning helpers.
+
+Role in ESRT: provides make_dataset(), the recursive file lister imported by
+data/RealSR.py; the ImageFolder dataset itself is not used by training.
+"""
 ###############################################################################
 # Code from
 # https://github.com/pytorch/vision/blob/master/torchvision/datasets/folder.py
@@ -12,6 +17,7 @@ import os
 import os.path
 
 def default_flist_reader(flist):
+    """Read a text file listing one image path per line; return the stripped paths."""
     imlist = []
     with open(flist, 'r') as rf:
         for line in rf.readlines():
@@ -28,10 +34,15 @@ IMG_EXTENSIONS = [
 
 
 def is_image_file(filename):
+    """True if `filename` ends with one of IMG_EXTENSIONS (images or .npy arrays)."""
     return any(filename.endswith(extension) for extension in IMG_EXTENSIONS)
 
 
 def make_dataset(dir):
+    """Recursively collect paths of all image files under `dir` (including `dir` itself).
+
+    Raises AssertionError if `dir` is not a directory.
+    """
     images = []
     assert os.path.isdir(dir), '%s is not a valid directory' % dir
 
@@ -45,10 +56,19 @@ def make_dataset(dir):
 
 
 def default_loader(path):
+    """Open an image with PIL and convert it to RGB."""
     return Image.open(path).convert('RGB')
 
 
 class ImageFolder(data.Dataset):
+    """Flat dataset over every image found under `root`.
+
+    Args:
+        root: directory to scan.
+        transform: optional callable applied to each loaded image.
+        return_paths: if True, __getitem__ returns (img, path).
+        loader: function mapping a path to an image.
+    """
 
     def __init__(self, root, transform=None, return_paths=False,
                  loader=default_loader):
