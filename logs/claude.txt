@@ -1,0 +1,57 @@
+Changes made by Claude (Claude Sonnet 5.5)
+==========================================
+
+1. train.py  -- added a main guard
+-----------------------------------
+Problem: on Python 3.14 the default multiprocessing start method on Linux is
+'forkserver'. DataLoader workers re-import train.py, and because all of its
+code ran at module level, each worker re-ran the whole script (argument
+parsing, model build, training loop) and crashed with:
+  RuntimeError: An attempt has been made to start a new process before the
+  current process has finished its bootstrapping phase.
+(seen in ../traceback.txt, raised from valid() -> DataLoader iterator).
+
+Changes:
+  - Module docstring: updated "runs on import" note to describe the guard.
+  - Kept at module level: imports, the argparse `parser` definition (no side
+    effects, no processes started).
+  - Moved into new main(): args = parser.parse_args(), seeding, cudnn flag,
+    device selection, dataset and DataLoader creation, model/loss creation,
+    optional --pretrained loading, optimizer creation, and the epoch loop.
+  - Added at the bottom:  if __name__ == '__main__': main()
+  - The helper functions previously read module-level globals. They now take
+    them as parameters instead:
+        train(epoch)            -> train(epoch, model, optimizer, l1_criterion,
+                                         training_data_loader, args, device)
+        valid(scale)            -> valid(scale, model, testing_data_loader,
+                                         args, device)
+        save_checkpoint(epoch)  -> save_checkpoint(epoch, model, args)
+    forward_chop() and print_network() already took explicit arguments and
+    are unchanged.
+  - Call sites inside main() were updated to match.
+  - No behaviour change intended: same order of operations, same messages,
+    same hyper-parameters. The body of main() is the old module-level code
+    indented one level.
+
+Verification done:
+  - File compiles (py_compile) and `import train` runs with no output and no
+    side effects (nothing executes on import).
+  - NOT run end to end: that needs the DF2K_decoded .npy data and
+    Test_Datasets/Set5 (+ Set5_LR) on disk. Please do a short run, e.g.
+        python train.py --root /data/data/div2k --scale 2 -nEpochs 1
+    and confirm the DataLoader workers start without the RuntimeError.
+
+Not changed (noticed, left alone)
+---------------------------------
+  - --amp is declared but not used anywhere yet (you said you would add AMP
+    by hand). Its type is bool, so `--amp False` on the CLI would still be
+    truthy; use a store_true flag when wiring it up.
+  - forward_chop's recursive call does not pass `scale` (pre-existing bug,
+    only reachable for very large images).
+  - utils.py compute_ssim uses the removed skimage `multichannel` argument
+    (needs channel_axis on scikit-image >= 0.21), and baseline/utils.py
+    imports the removed compare_psnr / compare_ssim.
+  - Test_Datasets/Set5 and Test_Datasets/Set5_LR/x<scale> must be created by
+    hand; the repo does not ship them.
+
+2. logs/claude.txt  -- this file (new; the logs/ folder did not exist).

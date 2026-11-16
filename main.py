@@ -60,9 +60,10 @@ def main():
         if not args.hf_repo:
             p.error("--hf_repo is required unless --skip_download is set")
         from huggingface_hub import snapshot_download
+        from os import environ
         snapshot_download(repo_id=args.hf_repo, repo_type="dataset",
-                          revision=args.hf_revision, local_dir=args.data_dir)
-
+                          revision=args.hf_revision, local_dir=args.data_dir,
+                          token=environ.get("HF_TOKEN"))
     def in_data(path):
         """Resolve `path` inside --data_dir if it exists there, else return it unchanged."""
         cand = os.path.join(args.data_dir, path)
