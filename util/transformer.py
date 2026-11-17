@@ -1,3 +1,10 @@
+"""Transformer components for ESRT: stochastic depth, patch embedding, MLP, the
+memory-efficient attention (EffAttention) and the full block (MLABlock).
+
+Role in ESRT: the "transformer" half of the model. MLABlock is instantiated
+inside the Un body block in model/esrt.py to add long-range (global) context to
+the CNN features cheaply.
+"""
 from model import common
 import torch
 import torch.nn as nn
@@ -17,6 +24,7 @@ class DropPath(nn.Module):
         self.drop_prob = drop_prob
 
     def forward(self, x):
+        # Only active in training mode; identity at eval time.
         return drop_path(x, self.drop_prob, self.training)
 
 def drop_path(x, drop_prob: float = 0., training: bool = False):
@@ -29,6 +37,8 @@ def drop_path(x, drop_prob: float = 0., training: bool = False):
     """
     if drop_prob == 0. or not training:
         return x
+    # Keep each sample's residual branch with prob keep_prob (rescaled by
+    # 1/keep_prob so the expectation is unchanged); drop the whole branch otherwise.
     keep_prob = 1 - drop_prob
     shape = (x.shape[0],) + (1,) * (x.ndim - 1)  # work with diff dim tensors, not just 2D ConvNets
     random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
@@ -36,7 +46,10 @@ def drop_path(x, drop_prob: float = 0., training: bool = False):
     output = x.div(keep_prob) * random_tensor
     return output
 class PatchEmbed(nn.Module):
-    """ Image to Patch Embedding
+    """ Image to Patch Embedding: a strided conv turns non-overlapping
+    patch_size x patch_size patches of a (B, C, H, W) image into a token
+    sequence (B, num_patches, embed_dim). Input must be exactly img_size.
+    Not used by the current ESRT (MLABlock unfolds patches itself).
     """
     def __init__(self, img_size=48, patch_size=2, in_chans=64, embed_dim=768):
         super().__init__()
@@ -58,6 +71,8 @@ class PatchEmbed(nn.Module):
         x = self.proj(x).flatten(2).transpose(1, 2)#64*48*48->768*6*6->768*36->36*768
         return x
 class Mlp(nn.Module):
+    """Transformer feed-forward network: Linear -> activation -> dropout -> Linear -> dropout.
+    The hidden width defaults to in_features // 4 (a bottleneck, unlike the usual 4x expansion)."""
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.ReLU, drop=0.):
         super().__init__()
         out_features = out_features or in_features
@@ -79,6 +94,15 @@ class Mlp(nn.Module):
 
 
 class EffAttention(nn.Module):
+    """Efficient multi-head self-attention (the "EMHA" of ESRT).
+
+    Tokens are first projected from `dim` to `dim // 2` channels to cut cost.
+    The token sequence is then split into 4 contiguous chunks and attention is
+    computed *within each chunk only*, so the cost is ~1/4 of full attention.
+    Chunk outputs are concatenated and projected back to `dim`.
+
+    Input/output: (B, N, dim).
+    """
     def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0.):
         super().__init__()
         self.num_heads = num_heads
@@ -90,6 +114,7 @@ class EffAttention(nn.Module):
         self.qkv = nn.Linear(dim//2, dim//2 * 3, bias=qkv_bias)
         self.proj = nn.Linear(dim//2, dim)
         self.attn_drop = nn.Dropout(attn_drop)
+        # Debug prints of the attention configuration (shown once at model construction).
         print('scale', self.scale)
         print(dim)
         print(dim//num_heads)
@@ -97,7 +122,7 @@ class EffAttention(nn.Module):
         # self.proj_drop = nn.Dropout(proj_drop)
 
     def forward(self, x):
-        x = self.reduce(x)
+        x = self.reduce(x)          # (B, N, dim) -> (B, N, dim//2)
         B, N, C = x.shape
         # pdb.set_trace()
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
@@ -108,12 +133,15 @@ class EffAttention(nn.Module):
         q, k, v = qkv[0], qkv[1], qkv[2]   # make torchscript happy (cannot use tensor as tuple)
         # pdb.set_trace()
         
+        # Split the N tokens into chunks of N//4 and attend within each chunk.
+        # (If N is not divisible by 4, split yields a short extra chunk.)
         q_all = torch.split(q, math.ceil(N//4), dim=-2)
         k_all = torch.split(k, math.ceil(N//4), dim=-2)
         v_all = torch.split(v, math.ceil(N//4), dim=-2)        
 
         output = []
         for q,k,v in zip(q_all, k_all, v_all):
+            # Scaled dot-product attention inside this chunk.
             attn = (q @ k.transpose(-2, -1)) * self.scale   #16*8*37*37
             attn = attn.softmax(dim=-1)
             attn = self.attn_drop(attn)
@@ -124,6 +152,8 @@ class EffAttention(nn.Module):
         # pdb.set_trace()
         # attn = torch.cat(att, dim=-2)
         # x = (attn @ v).transpose(1, 2).reshape(B, N, C) #16*37*768
+        # Each chunk output is (B, chunk_N, heads, head_dim); concatenating on
+        # dim=1 restores the full token order, then heads are merged into C.
         x = torch.cat(output,dim=1)
         x = x.reshape(B,N,C)
         # pdb.set_trace()
@@ -136,6 +166,16 @@ class EffAttention(nn.Module):
 
 ## Base block
 class MLABlock(nn.Module):
+    """Pre-norm transformer block over 3x3 image patches.
+
+    Takes a feature map (B, C, H, W), unfolds it into H*W overlapping 3x3
+    patches (tokens of size dim = C*9), then applies
+        x = x + EffAttention(LN(x));  x = x + Mlp(LN(x)).
+    Returns tokens (B, H*W, dim); the caller folds them back into a feature map.
+    Only `dim` and `drop`/`act_layer` are honoured; the other constructor
+    arguments are accepted for compatibility but unused (attention is
+    hard-coded to 8 heads, no bias, no dropout).
+    """
     def __init__(
         self, n_feat = 64,dim=768, num_heads=8, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
                  drop_path=0., act_layer=nn.ReLU, norm_layer=nn.LayerNorm):
@@ -154,6 +194,7 @@ class MLABlock(nn.Module):
         # x = posi + x
         # x = self.patch_embed(x) # 16*36*768
         # print(x.shape)
+        # Unfold into 3x3 patches: (B, C, H, W) -> (B, C*9, H*W) -> tokens (B, H*W, C*9)
         x = extract_image_patches(x, ksizes=[3, 3],
                                       strides=[1,1],
                                       rates=[1, 1],

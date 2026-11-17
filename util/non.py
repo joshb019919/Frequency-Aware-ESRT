@@ -1,9 +1,27 @@
+"""Non-local (self-attention) blocks for 1D/2D/3D inputs (Wang et al., "Non-local
+Neural Networks"), embedded-Gaussian-free variant: f = theta(x)^T phi(x) / N.
+This is the generic version imported by model/esrt.py (NONLocalBlock2D); it is
+imported there but not used in the current model.
+
+Role in ESRT: an alternative global-context module (CNN-style self-attention)
+that the transformer block (util/transformer.py) replaces.
+"""
 import torch
 from torch import nn
 from torch.nn import functional as F
 
 
 class _NonLocalBlockND(nn.Module):
+    """Base non-local block: z = W(softmax-free attention(x)) + x.
+
+    Args:
+        in_channels: channels of the input.
+        inter_channels: embedding channels (default in_channels // 2, min 1).
+        dimension: 1, 2 or 3 (selects Conv/MaxPool/BatchNorm variants).
+        sub_sample: max-pool the g and phi branches 2x to cut attention cost.
+        bn_layer: add BatchNorm after W. W's output layer is zero-initialised so
+            the block starts as an identity mapping.
+    """
     def __init__(self, in_channels, inter_channels=None, dimension=3, sub_sample=True, bn_layer=True):
         super(_NonLocalBlockND, self).__init__()
 
@@ -62,32 +80,36 @@ class _NonLocalBlockND(nn.Module):
 
     def forward(self, x):
         '''
-        :param x: (b, c, t, h, w)
-        :return:
+        :param x: input of shape (b, c, [t,] [h,] w) matching `dimension`
+        :return: tensor of the same shape as x
         '''
 
         batch_size = x.size(0)
 
+        # g: value embedding -> (b, positions, inter_channels)
         g_x = self.g(x).view(batch_size, self.inter_channels, -1)
         g_x = g_x.permute(0, 2, 1)
 
         theta_x = self.theta(x).view(batch_size, self.inter_channels, -1)
         theta_x = theta_x.permute(0, 2, 1)
         phi_x = self.phi(x).view(batch_size, self.inter_channels, -1)
+        # Pairwise affinity between every query position and every key position,
+        # normalised by the number of keys (no softmax in this variant).
         f = torch.matmul(theta_x, phi_x)
         N = f.size(-1)
         f_div_C = f / N
 
-        y = torch.matmul(f_div_C, g_x)
+        y = torch.matmul(f_div_C, g_x)               # aggregate values
         y = y.permute(0, 2, 1).contiguous()
-        y = y.view(batch_size, self.inter_channels, *x.size()[2:])
+        y = y.view(batch_size, self.inter_channels, *x.size()[2:])  # restore spatial layout
         W_y = self.W(y)
-        z = W_y + x
+        z = W_y + x                                  # residual connection
 
         return z
 
 
 class NONLocalBlock1D(_NonLocalBlockND):
+    """Non-local block for 1D (b, c, length) inputs."""
     def __init__(self, in_channels, inter_channels=None, sub_sample=True, bn_layer=True):
         super(NONLocalBlock1D, self).__init__(in_channels,
                                               inter_channels=inter_channels,
@@ -96,6 +118,7 @@ class NONLocalBlock1D(_NonLocalBlockND):
 
 
 class NONLocalBlock2D(_NonLocalBlockND):
+    """Non-local block for 2D image feature maps (b, c, h, w)."""
     def __init__(self, in_channels, inter_channels=None, sub_sample=True, bn_layer=True):
         super(NONLocalBlock2D, self).__init__(in_channels,
                                               inter_channels=inter_channels,
@@ -104,6 +127,7 @@ class NONLocalBlock2D(_NonLocalBlockND):
 
 
 class NONLocalBlock3D(_NonLocalBlockND):
+    """Non-local block for 3D/video (b, c, t, h, w) inputs."""
     def __init__(self, in_channels, inter_channels=None, sub_sample=True, bn_layer=True):
         super(NONLocalBlock3D, self).__init__(in_channels,
                                               inter_channels=inter_channels,

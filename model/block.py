@@ -1,15 +1,24 @@
+"""Layer-construction helpers (from the IMDN code base): conv/norm/pad/activation
+factories, a sequential() flattener, channel statistics and a pixel-shuffle block.
+
+Role in ESRT: not used by model/esrt.py directly. It is a leftover from the
+IMDN baseline (see the commented-out IMDN reference in train.py) and is kept as
+a toolbox for alternative architectures.
+"""
 import torch.nn as nn
 from collections import OrderedDict
 import torch
 
 
 def conv_layer(in_channels, out_channels, kernel_size, stride=1, dilation=1, groups=1, bias=True):
+    """Conv2d whose padding keeps H and W unchanged (for stride 1), accounting for dilation."""
     padding = int((kernel_size - 1) / 2) * dilation
     return nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding=padding, bias=bias, dilation=dilation,
                      groups=groups)
 
 
 def norm(norm_type, nc):
+    """Return a normalization layer over `nc` channels: 'batch' or 'instance'."""
     norm_type = norm_type.lower()
     if norm_type == 'batch':
         layer = nn.BatchNorm2d(nc, affine=True)
@@ -21,6 +30,7 @@ def norm(norm_type, nc):
 
 
 def pad(pad_type, padding):
+    """Return a padding layer ('reflect' or 'replicate'), or None if padding == 0."""
     pad_type = pad_type.lower()
     if padding == 0:
         return None
@@ -34,6 +44,7 @@ def pad(pad_type, padding):
 
 
 def get_valid_padding(kernel_size, dilation):
+    """Padding that preserves spatial size for a dilated conv (effective kernel = k + (k-1)(d-1))."""
     kernel_size = kernel_size + (kernel_size - 1) * (dilation - 1)
     padding = (kernel_size - 1) // 2
     return padding
@@ -41,6 +52,10 @@ def get_valid_padding(kernel_size, dilation):
 
 def conv_block(in_nc, out_nc, kernel_size, stride=1, dilation=1, groups=1, bias=True,
                pad_type='zero', norm_type=None, act_type='relu'):
+    """Build [pad] -> conv -> [norm] -> [activation] as one nn.Sequential.
+
+    Zero padding is done inside the conv; reflect/replicate use a separate pad layer.
+    """
     padding = get_valid_padding(kernel_size, dilation)
     p = pad(pad_type, padding) if pad_type and pad_type != 'zero' else None
     padding = padding if pad_type == 'zero' else 0
@@ -53,6 +68,7 @@ def conv_block(in_nc, out_nc, kernel_size, stride=1, dilation=1, groups=1, bias=
 
 
 def activation(act_type, inplace=True, neg_slope=0.05, n_prelu=1):
+    """Return an activation layer: 'relu', 'lrelu' (LeakyReLU) or 'prelu'."""
     act_type = act_type.lower()
     if act_type == 'relu':
         layer = nn.ReLU(inplace)
@@ -66,6 +82,7 @@ def activation(act_type, inplace=True, neg_slope=0.05, n_prelu=1):
 
 
 class ShortcutBlock(nn.Module):
+    """Wrap a submodule with an identity skip: forward(x) = x + sub(x)."""
     def __init__(self, submodule):
         super(ShortcutBlock, self).__init__()
         self.sub = submodule
@@ -75,17 +92,21 @@ class ShortcutBlock(nn.Module):
         return output
 
 def mean_channels(F):
+    """Per-channel spatial mean of a (B, C, H, W) tensor -> (B, C, 1, 1)."""
     assert(F.dim() == 4)
     spatial_sum = F.sum(3, keepdim=True).sum(2, keepdim=True)
     return spatial_sum / (F.size(2) * F.size(3))
 
 def stdv_channels(F):
+    """Per-channel spatial standard deviation of a (B, C, H, W) tensor -> (B, C, 1, 1)
+    (used for contrast-aware channel attention)."""
     assert(F.dim() == 4)
     F_mean = mean_channels(F)
     F_variance = (F - F_mean).pow(2).sum(3, keepdim=True).sum(2, keepdim=True) / (F.size(2) * F.size(3))
     return F_variance.pow(0.5)
 
 def sequential(*args):
+    """Like nn.Sequential, but skips None entries and flattens nested nn.Sequentials."""
     if len(args) == 1:
         if isinstance(args[0], OrderedDict):
             raise NotImplementedError('sequential does not support OrderedDict input.')
@@ -101,6 +122,7 @@ def sequential(*args):
 
     
 def pixelshuffle_block(in_channels, out_channels, upscale_factor=2, kernel_size=3, stride=1):
+    """Sub-pixel upsampling: conv to out_channels * r^2, then PixelShuffle(r)."""
     conv = conv_layer(in_channels, out_channels * (upscale_factor ** 2), kernel_size, stride)
     pixel_shuffle = nn.PixelShuffle(upscale_factor)
     return sequential(conv, pixel_shuffle)
