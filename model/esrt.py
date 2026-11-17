@@ -1,3 +1,21 @@
+"""ESRT: Efficient Super-Resolution Transformer.
+
+Role in ESRT: this file IS the model. Everything else (data, training,
+evaluation, utilities) exists to feed, train or measure the ESRT class below.
+
+Architecture overview (see ESRT class):
+    head conv -> Un body (3 Updownblocks + efficient transformer attention)
+    -> tail (upsampler) ; plus a global skip path that upsamples the head
+    features directly and is added to the tail output.
+
+Building blocks in this file:
+    CALayer      channel attention (squeeze-and-excite)
+    one_conv     lightweight residual conv pair with learnable scales
+    BasicConv    conv (+BN/ReLU/resize) helper
+    one_module   small residual block built from two one_conv + channel attention
+    Updownblock  splits features into low/high frequency and processes each
+    Un           stack of Updownblocks followed by the transformer block (MLABlock)
+"""
 from model import common
 import torch
 import torch.nn as nn
@@ -13,6 +31,7 @@ import pdb
 import math
 
 def make_model(upscale=4):
+    """Factory returning an ESRT model for the given upscale factor."""
     # inpu = torch.randn(1, 3, 320, 180).cpu()
     # flops, params = profile(RTC(upscale).cpu(), inputs=(inpu,))
     # print(params)
@@ -22,6 +41,12 @@ def make_model(upscale=4):
 
 ## Channel Attention (CA) Layer
 class CALayer(nn.Module):
+    """Squeeze-and-excitation channel attention.
+
+    Global-average-pools each channel to a scalar, passes the vector through a
+    bottleneck (channel -> channel//reduction -> channel) with a sigmoid, and
+    rescales the input channels by the resulting weights.
+    """
     def __init__(self, channel, reduction=16):
         super(CALayer, self).__init__()
         # global average pooling: feature --> point
@@ -35,12 +60,18 @@ class CALayer(nn.Module):
         )
 
     def forward(self, x):
-        y = self.avg_pool(x)
-        y = self.conv_du(y)
+        y = self.avg_pool(x)    # (B, C, 1, 1) channel descriptor
+        y = self.conv_du(y)     # per-channel weights in (0, 1)
         return x * y
 
 
 class one_conv(nn.Module):
+    """Residual bottleneck conv: out = w1 * x + w2 * conv1(act(conv(x))).
+
+    `conv` reduces channels to `growth_rate`, `conv1` restores them to the input
+    width. w1/w2 are learnable scalar weights (common.Scale, initialised to 1).
+    Set relu=False to drop the PReLU between the two convs.
+    """
     def __init__(self,inchanels,growth_rate,kernel_size = 3, relu = True):
         super(one_conv,self).__init__()
         wn = lambda x:torch.nn.utils.weight_norm(x)
@@ -59,6 +90,10 @@ class one_conv(nn.Module):
         return output#torch.cat((x,output),1)
         
 class BasicConv(nn.Module):
+    """Conv2d (or ConvTranspose2d if fan=True) with optional BatchNorm, ReLU and
+    bilinear resize to a fixed `up_size` x `up_size` output (disabled when 0).
+    Applied in that order: conv -> bn -> relu -> resize.
+    """
     def __init__(self, in_planes, out_planes, kernel_size, stride=1, padding=1, dilation=1, groups=1, relu=True,
                  bn=False, bias=False, up_size=0,fan=False):
         super(BasicConv, self).__init__()
@@ -87,6 +122,12 @@ class BasicConv(nn.Module):
         return x
 
 class one_module(nn.Module):
+    """Residual feature block.
+
+    Two chained one_conv layers; their outputs are concatenated, fused by a 1x1
+    conv (`alise`), reweighted by channel attention, refined by a 3x3 conv, and
+    added back to the input with learnable scales.
+    """
     def __init__(self, n_feats):
         super(one_module, self).__init__()
         self.layer1 = one_conv(n_feats, n_feats//2,3)
@@ -110,6 +151,14 @@ class one_module(nn.Module):
         return self.weight4(x)+self.weight5(x4)
 
 class Updownblock(nn.Module):
+    """Frequency-split block (the "frequency-aware" part of this variant).
+
+    Features are encoded, then average-pooled 2x to get a low-frequency
+    (coarse) branch. The high-frequency residual is the encoded feature minus the
+    upsampled low-frequency one. Each band is processed by its own decoder, the
+    bands are recombined (concat -> 1x1 conv -> channel attention -> refine),
+    and a skip connection from the block input is added.
+    """
     def __init__(self, n_feats):
         super(Updownblock, self).__init__()
         self.encoder = one_module(n_feats)
@@ -124,17 +173,30 @@ class Updownblock(nn.Module):
 
     def forward(self, x):
         x1 = self.encoder(x)
-        x2 = self.down(x1)
+        x2 = self.down(x1)  # low-frequency branch at half resolution
+        # High-frequency detail = features minus their blurred (down/up-sampled) version.
         high = x1 - F.interpolate(x2, size = x.size()[-2:], mode='bilinear', align_corners=True)
+        # The same decoder_low block (shared weights) is applied 5 times.
         for i in range(5):
             x2 = self.decoder_low(x2)
         x3 = x2
         # x3 = self.decoder_low(x2)
         high1 = self.decoder_high(high)
+        # Upsample the processed low-frequency branch back to full resolution.
         x4 = F.interpolate(x3, size = x.size()[-2:], mode='bilinear', align_corners=True)
         return self.alise(self.att(self.alise2(torch.cat([x4,high1],dim=1))))+ x
 
 class Un(nn.Module):
+    """ESRT body block: 3 chained Updownblocks + transformer attention.
+
+    The three block outputs are concatenated and reduced to `n_feats` channels,
+    turned into 3x3 patch tokens, passed through the MLABlock (efficient
+    multi-head attention + MLP), folded back to a feature map, and added to the
+    input through a learnable-scaled residual. `wn` is unused.
+
+    The attention dim=288 equals n_feats(32) * 3 * 3, i.e. one flattened 3x3
+    patch per token, so it is tied to n_feats=32.
+    """
     def __init__(self,n_feats, wn):
         super(Un, self).__init__()
         self.encoder1 = Updownblock(n_feats)
@@ -153,14 +215,24 @@ class Un(nn.Module):
         x3 = self.encoder3(x2)
         out = x3
         b,c,h,w = x3.shape
+        # (B, 3C, H, W) -> (B, C, H, W) -> tokens (B, H*W, C*9) after attention
         out = self.attention(self.reduce(torch.cat([x1,x2,x3],dim=1)))
-        out = out.permute(0,2,1)
-        out = reverse_patches(out, (h,w), (3,3), 1, 1)
+        out = out.permute(0,2,1)                           # (B, C*9, H*W) for Fold
+        out = reverse_patches(out, (h,w), (3,3), 1, 1)     # fold tokens back to (B, C, H, W)
         out = self.alise(out)
 
         return self.weight1(x) + self.weight2(out)
         
 class ESRT(nn.Module):
+    """Top-level super-resolution network.
+
+    Args:
+        upscale: SR factor (2^n or 3, as supported by common.Upsampler).
+        conv: conv factory (default: 'same'-padded nn.Conv2d).
+
+    Input: LR RGB image (B, 3, H, W) in [0, 1]. Output: (B, 3, scale*H, scale*W).
+    Uses n_feats=32 feature channels and a single `Un` body block.
+    """
     def __init__(self, upscale=4, conv=common.default_conv):
         super(ESRT, self).__init__()
         wn = lambda x:torch.nn.utils.weight_norm(x)
@@ -177,7 +249,8 @@ class ESRT(nn.Module):
         rgb_std = (1.0, 1.0, 1.0)
         # self.sub_mean = common.MeanShift(args.rgb_range, rgb_mean, rgb_std)
         
-        # define head module
+        # NOTE: the mean shift is disabled; inputs are used as-is in [0, 1].
+        # define head module (shallow feature extraction)
         modules_head = [conv(3, n_feats, kernel_size)]
         
         # define body module
@@ -186,13 +259,14 @@ class ESRT(nn.Module):
             modules_body.append(
                 Un(n_feats=n_feats, wn = wn))
 
-        # define tail module
+        # define tail module (upsample deep features, project back to RGB)
         modules_tail = [
 
             common.Upsampler(conv, scale, n_feats, act=False),
             conv(n_feats, 3, kernel_size)]
 
 
+        # Global skip path: upsample the shallow (head) features straight to RGB.
         self.up = nn.Sequential(common.Upsampler(conv,scale,n_feats,act=False),
                           BasicConv(n_feats, 3,3,1,1))
         self.head = nn.Sequential(*modules_head)
@@ -202,25 +276,33 @@ class ESRT(nn.Module):
 
 
     def forward(self, x1,x2 = None, test=False):
+        """Super-resolve `x1` (B, 3, H, W). `x2` and `test` are unused (kept for API compatibility)."""
         # x1 = self.sub_mean(x1)
         x1 = self.head(x1)
-        res2 = x1
+        res2 = x1  # shallow features, reused by the global skip path
         #res2 = x2
         body_out = []
         for i in range(self.n_blocks):
             x1 = self.body[i](x1)
             body_out.append(x1)
         res1 = torch.cat(body_out,1)
-        res1 = self.reduce(res1)
+        res1 = self.reduce(res1)  # fuse outputs of all body blocks
 
-        
+
         x1 = self.tail(res1)
-        x1 = self.up(res2) + x1
+        x1 = self.up(res2) + x1   # add the global skip (long-range residual)
         # x1 = self.add_mean(x1)
         #x2 = self.tail(res2)
         return x1
 
     def load_state_dict(self, state_dict, strict=False):
+        """Lenient weight loader (overrides nn.Module.load_state_dict; returns None).
+
+        Copies each tensor whose name exists in this model. A shape mismatch in a
+        'tail' (upsampler) parameter is skipped with a message so a model
+        pre-trained at another scale can be reused; any other mismatch raises.
+        With strict=True, unexpected/missing keys (other than 'tail') raise KeyError.
+        """
         own_state = self.state_dict()
         for name, param in state_dict.items():
             if name in own_state:

@@ -1,5 +1,10 @@
 """Download a dataset from Hugging Face, then launch ESRT training or testing.
 
+Role in ESRT: top-level command-line launcher. ESRT (Efficient Super-Resolution
+Transformer) is a lightweight image super-resolution network (CNN feature
+extractor + efficient transformer attention); this script fetches the data and
+runs train.py or test.py as a subprocess, logging run time to timings.log.
+
 Examples:
   python main.py --train --hf_repo USER/DIV2K --scale 2 -- --patch_size 96
   python main.py --test  --hf_repo USER/benchmark --scale 4 \
@@ -14,11 +19,19 @@ import argparse
 import os
 import subprocess
 import sys
+import time
 
+# Repo root; train.py/test.py are launched from here so their relative paths resolve.
 ROOT = os.path.dirname(os.path.abspath(__file__))
 
 
 def main():
+    """Parse launcher args, optionally download the dataset, then run train.py or test.py.
+
+    Builds a subprocess command line for the chosen mode, forwards any extra
+    arguments, times the run, appends a line to timings.log and exits with the
+    child's return code.
+    """
     p = argparse.ArgumentParser(description="ESRT launcher")
     mode = p.add_mutually_exclusive_group(required=True)
     mode.add_argument("--train", action="store_true", help="run train.py")
@@ -35,18 +48,24 @@ def main():
     p.add_argument("--test_lr_folder")
     p.add_argument("--checkpoint")
     p.add_argument("--output_folder")
+
+    # Unknown args are kept in `extra` and passed through to the child script.
     args, extra = p.parse_known_args()
     if extra and extra[0] == "--":
         extra = extra[1:]
 
+    # Fetch the dataset snapshot from the Hugging Face Hub (imported lazily so
+    # --skip_download works without huggingface_hub installed).
     if not args.skip_download:
         if not args.hf_repo:
             p.error("--hf_repo is required unless --skip_download is set")
         from huggingface_hub import snapshot_download
+        from os import environ
         snapshot_download(repo_id=args.hf_repo, repo_type="dataset",
-                          revision=args.hf_revision, local_dir=args.data_dir)
-
+                          revision=args.hf_revision, local_dir=args.data_dir,
+                          token=environ.get("HF_TOKEN"))
     def in_data(path):
+        """Resolve `path` inside --data_dir if it exists there, else return it unchanged."""
         cand = os.path.join(args.data_dir, path)
         return cand if os.path.exists(cand) else path
 
@@ -61,11 +80,25 @@ def main():
                "--test_lr_folder", in_data(args.test_lr_folder),
                "--checkpoint", args.checkpoint,
                "--upscale_factor", str(args.scale)]
+        
         if args.output_folder:
             cmd += ["--output_folder", args.output_folder]
-    cmd += extra
+
+    cmd += extra  # user-supplied passthrough flags go last so they can override
     print("Running:", " ".join(cmd))
-    sys.exit(subprocess.call(cmd, cwd=ROOT))
+
+    start = time.perf_counter()
+    rc = subprocess.call(cmd, cwd=ROOT)
+    elapsed = time.perf_counter() - start
+
+    mode = "train" if args.train else "test"
+    print("[main.py] {} finished in {:.1f}s (exit code {})".format(mode, elapsed, rc))
+    
+    # Append one tab-separated record per run: timestamp, mode, scale, duration, rc.
+    with open(os.path.join(ROOT, "timings.log"), "a") as f:
+        f.write("{}\t{}\tscale={}\t{:.1f}s\trc={}\n".format(
+            time.strftime("%Y-%m-%d %H:%M:%S"), mode, args.scale, elapsed, rc))
+    sys.exit(rc)
 
 
 if __name__ == "__main__":

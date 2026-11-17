@@ -1,3 +1,8 @@
+"""DIV2K/DF2K training dataset: random LR/HR patch pairs with augmentation.
+
+Role in ESRT: the training data source used by train.py. Each item is an aligned
+(LR patch, HR patch) pair the network learns to map between.
+"""
 import torch.utils.data as data
 import os.path
 import cv2
@@ -5,9 +10,11 @@ import numpy as np
 from data import common
 
 def default_loader(path):
+    """Read an image file with OpenCV and return it as an RGB array (cv2 gives BGR)."""
     return cv2.imread(path, cv2.IMREAD_UNCHANGED)[:, :, [2, 1, 0]]
 
 def npy_loader(path):
+    """Load a pre-decoded image saved as .npy (see scripts/png2npy.py); much faster than PNG decoding."""
     return np.load(path)
 
 IMG_EXTENSIONS = [
@@ -15,9 +22,11 @@ IMG_EXTENSIONS = [
 ]
 
 def is_image_file(filename):
+    """True if the file name ends with a supported extension (.png or .npy)."""
     return any(filename.endswith(extension) for extension in IMG_EXTENSIONS)
 
 def make_dataset(dir):
+    """Recursively collect paths of all supported image files under `dir`."""
     images = []
     assert os.path.isdir(dir), '%s is not a valid directory' % dir
 
@@ -30,22 +39,34 @@ def make_dataset(dir):
 
 
 class div2k(data.Dataset):
+    """Training dataset yielding (lr_tensor, hr_tensor) random patch pairs.
+
+    Expects <root>/DF2K_decoded/DIV2K_train_HR and
+    <root>/DF2K_decoded/DIV2K_train_LR_bicubic/X<scale>. `opt` is the argparse
+    namespace from train.py (uses scale, root, ext, phase, n_train, n_colors,
+    rgb_range, patch_size).
+
+    Only the 'train' phase is supported: __len__ returns None otherwise.
+    """
     def __init__(self, opt):
         self.opt = opt
         self.scale = self.opt.scale
         self.root = self.opt.root
         self.ext = self.opt.ext   # '.png' or '.npy'(default)
         self.train = True if self.opt.phase == 'train' else False
+        # Each image is visited `repeat` times per epoch (different random patch each time).
         self.repeat = 10#self.opt.test_every // (self.opt.n_train // self.opt.batch_size)
         self._set_filesystem(self.root)
         self.images_hr, self.images_lr = self._scan()
 
     def _set_filesystem(self, dir_data):
+        """Set the HR and LR (bicubic, X<scale>) directories under <dir_data>/DF2K_decoded."""
         self.root = dir_data + '/DF2K_decoded'
         self.dir_hr = os.path.join(self.root, 'DIV2K_train_HR')
         self.dir_lr = os.path.join(self.root, 'DIV2K_train_LR_bicubic/X' + str(self.scale))
 
     def __getitem__(self, idx):
+        """Load image `idx`, crop an aligned random patch, augment, return CHW float tensors."""
         lr, hr = self._load_file(idx)
         lr, hr = self._get_patch(lr, hr)
         lr, hr = common.set_channel(lr, hr, n_channels=self.opt.n_colors)
@@ -53,16 +74,19 @@ class div2k(data.Dataset):
         return lr_tensor, hr_tensor
 
     def __len__(self):
+        """Samples per epoch = n_train * repeat."""
         if self.train:
             return self.opt.n_train * self.repeat
 
     def _get_index(self, idx):
+        """Map a (repeated) sample index to a file index (wraps modulo n_train)."""
         if self.train:
             return idx % self.opt.n_train
         else:
             return idx
 
     def _get_patch(self, img_in, img_tar):
+        """Training: random aligned crop + flip/rotate. Otherwise: crop HR to scale * LR size."""
         patch_size = self.opt.patch_size
         scale = self.scale
         if self.train:
@@ -75,11 +99,13 @@ class div2k(data.Dataset):
         return img_in, img_tar
 
     def _scan(self):
+        """Return sorted HR and LR file lists; sorting keeps the two lists paired by index."""
         list_hr = sorted(make_dataset(self.dir_hr))
         list_lr = sorted(make_dataset(self.dir_lr))
         return list_hr, list_lr
 
     def _load_file(self, idx):
+        """Load the (lr, hr) image pair for sample `idx` from .npy or image files."""
         idx = self._get_index(idx)
         if self.ext == '.npy':
             lr = npy_loader(self.images_lr[idx])

@@ -1,3 +1,11 @@
+"""Hook-based FLOP / parameter counter (derived from the pytorch-OpCounter
+`thop` project). Registers a forward hook on every leaf module, runs one
+forward pass on zeros, and sums the per-module op counts.
+
+Role in ESRT: computes the model's FLOPs/parameters, the efficiency figures
+reported alongside PSNR/SSIM for a lightweight SR network. Not needed for
+training or inference.
+"""
 import logging
 
 import torch
@@ -6,6 +14,8 @@ from torch.nn.modules.conv import _ConvNd
 
 from .count_hooks import *
 
+# Maps a leaf module type to the hook that computes its op count.
+# A value of None means "counted as zero ops" (e.g. Dropout).
 register_hooks = {
     nn.Conv1d: count_convNd,
     nn.Conv2d: count_convNd,
@@ -43,12 +53,28 @@ register_hooks = {
 
 
 def profile(model, input_size, custom_ops={}, device="cpu"):
+    """Count operations and parameters of `model` for one forward pass.
+
+    Args:
+        model: nn.Module to analyse (temporarily switched to eval mode).
+        input_size: shape of the dummy input, e.g. (1, 3, 64, 64).
+        custom_ops: optional {module_type: hook_fn} overriding/extending register_hooks.
+        device: device used for the profiling pass.
+
+    Returns:
+        (total_ops, total_params) as floats. Ops follow the hook definitions in
+        count_hooks.py (multiply-accumulates counted as one op for convs).
+        Leaf modules with no registered hook are reported as "Not implemented"
+        and contribute 0 ops.
+    """
     handler_collection = []
 
     def add_hooks(m):
+        # Only instrument leaf modules (containers are counted via their children).
         if len(list(m.children())) > 0:
             return
 
+        # Per-module accumulators filled in by the hooks / parameter count below.
         m.register_buffer('total_ops', torch.zeros(1))
         m.register_buffer('total_params', torch.zeros(1))
 
@@ -76,6 +102,7 @@ def profile(model, input_size, custom_ops={}, device="cpu"):
     model.eval().to(device)
     model.apply(add_hooks)
 
+    # One forward pass triggers every hook and populates m.total_ops.
     x = torch.zeros(input_size).to(device)
     with torch.no_grad():
         model(x)
@@ -91,6 +118,7 @@ def profile(model, input_size, custom_ops={}, device="cpu"):
     total_ops = total_ops.item()
     total_params = total_params.item()
 
+    # Restore the model's original mode/device and remove the hooks.
     model.train(training).to(original_device)
     for handler in handler_collection:
         handler.remove()

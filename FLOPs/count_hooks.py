@@ -1,12 +1,21 @@
+"""Forward hooks that estimate the op count of individual layer types.
+
+Each hook has the PyTorch forward-hook signature hook(module, inputs, output)
+and stores its result in `module.total_ops` (a 1-element tensor), which
+profile.py later sums. Here one multiply-accumulate counts as one op.
+
+Role in ESRT: the per-layer cost formulas behind FLOPs/profile.py.
+"""
 import argparse
 
 import torch
 import torch.nn as nn
 
-multiply_adds = 1
+multiply_adds = 1  # 1 = count a multiply-add as a single op (MAC); 2 = count both
 
 
 def count_convNd(m, x, y):
+    """Ops for Conv1d/2d/3d: output_elements * cin * (kernel_size + bias) / groups."""
     x = x[0]
     cin = m.in_channels
     batch_size = x.size(0)
@@ -23,6 +32,7 @@ def count_convNd(m, x, y):
 
 
 def count_conv2d(m, x, y):
+    """Conv2d-specific variant of count_convNd (not registered by default)."""
     x = x[0]
 
     cin = m.in_channels
@@ -49,6 +59,7 @@ def count_conv2d(m, x, y):
 
 
 def count_convtranspose2d(m, x, y):
+    """Ops for ConvTranspose2d: every output element touches the whole weight tensor."""
     x = x[0]
 
     cin = m.in_channels
@@ -77,6 +88,7 @@ def count_convtranspose2d(m, x, y):
 
 
 def count_bn(m, x, y):
+    """BatchNorm: 4 ops per element."""
     x = x[0]
 
     nelements = x.numel()
@@ -87,6 +99,7 @@ def count_bn(m, x, y):
 
 
 def count_relu(m, x, y):
+    """ReLU-like activations: 1 op per element."""
     x = x[0]
 
     nelements = x.numel()
@@ -96,6 +109,7 @@ def count_relu(m, x, y):
 
 
 def count_sigmoid(m, x, y):
+    """Sigmoid: exp + add + divide per element (3 ops)."""
     x = x[0]
     nelements = x.numel()
 
@@ -107,6 +121,7 @@ def count_sigmoid(m, x, y):
     m.total_ops = torch.Tensor([int(total_ops)])
 
 def count_pixelshuffle(m, x, y):
+    """PixelShuffle: one memory move per element, counted as 1 op."""
     x = x[0]
     nelements = x.numel()
     total_ops = nelements
@@ -114,6 +129,7 @@ def count_pixelshuffle(m, x, y):
 
 
 def count_softmax(m, x, y):
+    """Softmax over (batch, features): exp + add + divide per feature (not registered by default)."""
     x = x[0]
 
     batch_size, nfeatures = x.size()
@@ -127,6 +143,7 @@ def count_softmax(m, x, y):
 
 
 def count_maxpool(m, x, y):
+    """MaxPool: kernel_size comparisons per output element."""
     kernel_ops = torch.prod(torch.Tensor([m.kernel_size]))
     num_elements = y.numel()
     total_ops = kernel_ops * num_elements
@@ -135,6 +152,7 @@ def count_maxpool(m, x, y):
 
 
 def count_adap_maxpool(m, x, y):
+    """AdaptiveMaxPool: window size inferred as input_size // output_size."""
     kernel = torch.Tensor([*(x[0].shape[2:])]) // torch.Tensor(list((m.output_size,))).squeeze()
     kernel_ops = torch.prod(kernel)
     num_elements = y.numel()
@@ -144,6 +162,7 @@ def count_adap_maxpool(m, x, y):
 
 
 def count_avgpool(m, x, y):
+    """AvgPool: (kernel_size adds + 1 divide) per output element."""
     total_add = torch.prod(torch.Tensor([m.kernel_size]))
     total_div = 1
     kernel_ops = total_add + total_div
@@ -154,6 +173,7 @@ def count_avgpool(m, x, y):
 
 
 def count_adap_avgpool(m, x, y):
+    """AdaptiveAvgPool: window size inferred as input_size // output_size, plus 1 divide."""
     kernel = torch.Tensor([*(x[0].shape[2:])]) // torch.Tensor(list((m.output_size,))).squeeze()
     total_add = torch.prod(kernel)
     total_div = 1
@@ -165,6 +185,7 @@ def count_adap_avgpool(m, x, y):
 
 
 def count_linear(m, x, y):
+    """Linear: (in_features multiplies + in_features-1 adds) per output element."""
     # per output element
     total_mul = m.in_features
     total_add = m.in_features - 1

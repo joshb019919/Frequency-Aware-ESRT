@@ -1,0 +1,141 @@
+Running: /data/venvs/ml/bin/python /home/user/Documents/msu/725_vision/proj/Frequency-Aware-ESRT/train.py --root /data/data/div2k --scale 2 -nEpochs 1
+Namespace(batch_size=16, testBatchSize=1, nEpochs=1, lr=0.0002, step_size=200, gamma=0.5, cuda=True, resume='', start_epoch=1, threads=8, root='/data/data/div2k', n_train=800, n_val=1, test_every=1000, scale=2, patch_size=192, rgb_range=1, n_colors=3, pretrained='', seed=1, isY=True, ext='.npy', phase='train', model='ESRT', amp=False)
+Ramdom Seed:  1
+===> Loading datasets
+===> Building models
+scale 0.16666666666666666
+288
+36
+===> Setting GPU
+===> Setting Optimizer
+===> Training
+Total number of parameters: 677783
+Namespace(batch_size=16, testBatchSize=1, nEpochs=1, lr=0.0002, step_size=200, gamma=0.5, cuda=True, resume='', start_epoch=1, threads=8, root='/data/data/div2k', n_train=800, n_val=1, test_every=1000, scale=2, patch_size=192, rgb_range=1, n_colors=3, pretrained='', seed=1, isY=True, ext='.npy', phase='train', model='ESRT', amp=False)
+Ramdom Seed:  1
+===> Loading datasets
+===> Building models
+scale 0.16666666666666666
+288
+36
+===> Setting GPU
+===> Setting Optimizer
+===> Training
+Total number of parameters: 677783
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+    import sys; from multiprocessing.forkserver import main; main(43, 44, ['__main__'], sys_argv=sys.argv[1:], **{'sys_path': ['/home/user/Documents/msu/725_vision/proj/Frequency-Aware-ESRT', '/usr/lib/python314.zip', '/usr/lib/python3.14', '/usr/lib/python3.14/lib-dynload', '/data/venvs/ml/lib/python3.14/site-packages', '/data/venvs/ml/lib/python3.14/site-packages/setuptools/_vendor'], 'main_path': '/home/user/Documents/msu/725_vision/proj/Frequency-Aware-ESRT/train.py', 'authkey_r': 46})
+                                                             ~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.14/multiprocessing/forkserver.py", line 230, in main
+    spawn.import_main_path(main_path)
+    ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^
+  File "/usr/lib/python3.14/multiprocessing/spawn.py", line 307, in import_main_path
+    _fixup_main_from_path(main_path)
+    ~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^
+  File "/usr/lib/python3.14/multiprocessing/spawn.py", line 297, in _fixup_main_from_path
+    main_content = runpy.run_path(main_path,
+                                  run_name="__mp_main__")
+  File "<frozen runpy>", line 287, in run_path
+  File "<frozen runpy>", line 98, in _run_module_code
+  File "<frozen runpy>", line 88, in _run_code
+  File "/home/user/Documents/msu/725_vision/proj/Frequency-Aware-ESRT/train.py", line 277, in <module>
+    valid(args.scale)
+    ~~~~~^^^^^^^^^^^^
+  File "/home/user/Documents/msu/725_vision/proj/Frequency-Aware-ESRT/train.py", line 224, in valid
+    for batch in testing_data_loader:
+                 ^^^^^^^^^^^^^^^^^^^
+  File "/data/venvs/ml/lib/python3.14/site-packages/torch/utils/data/dataloader.py", line 505, in __iter__
+    return self._get_iterator()
+           ~~~~~~~~~~~~~~~~~~^^
+  File "/data/venvs/ml/lib/python3.14/site-packages/torch/utils/data/dataloader.py", line 438, in _get_iterator
+    return _MultiProcessingDataLoaderIter(self)
+  File "/data/venvs/ml/lib/python3.14/site-packages/torch/utils/data/dataloader.py", line 1178, in __init__
+    w.start()
+    ~~~~~~~^^
+  File "/usr/lib/python3.14/multiprocessing/process.py", line 121, in start
+    self._popen = self._Popen(self)
+                  ~~~~~~~~~~~^^^^^^
+  File "/usr/lib/python3.14/multiprocessing/context.py", line 230, in _Popen
+    return _default_context.get_context().Process._Popen(process_obj)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^
+  File "/usr/lib/python3.14/multiprocessing/context.py", line 306, in _Popen
+    return Popen(process_obj)
+  File "/usr/lib/python3.14/multiprocessing/popen_forkserver.py", line 35, in __init__
+    super().__init__(process_obj)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^
+  File "/usr/lib/python3.14/multiprocessing/popen_fork.py", line 20, in __init__
+    self._launch(process_obj)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^
+  File "/usr/lib/python3.14/multiprocessing/popen_forkserver.py", line 42, in _launch
+    prep_data = spawn.get_preparation_data(process_obj._name)
+  File "/usr/lib/python3.14/multiprocessing/spawn.py", line 164, in get_preparation_data
+    _check_not_importing_main()
+    ~~~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "/usr/lib/python3.14/multiprocessing/spawn.py", line 140, in _check_not_importing_main
+    raise RuntimeError('''
+    ...<16 lines>...
+    ''')
+RuntimeError: 
+        An attempt has been made to start a new process before the
+        current process has finished its bootstrapping phase.
+
+        This probably means that you are not using fork to start your
+        child processes and you have forgotten to use the proper idiom
+        in the main module:
+
+            if __name__ == '__main__':
+                freeze_support()
+                ...
+
+        The "freeze_support()" line can be omitted if the program
+        is not going to be frozen to produce an executable.
+
+        To fix this issue, refer to the "Safe importing of main module"
+        section in https://docs.python.org/3/library/multiprocessing.html
+        
+Traceback (most recent call last):
+  File "/home/user/Documents/msu/725_vision/proj/Frequency-Aware-ESRT/train.py", line 277, in <module>
+    valid(args.scale)
+    ~~~~~^^^^^^^^^^^^
+  File "/home/user/Documents/msu/725_vision/proj/Frequency-Aware-ESRT/train.py", line 224, in valid
+    for batch in testing_data_loader:
+                 ^^^^^^^^^^^^^^^^^^^
+  File "/data/venvs/ml/lib/python3.14/site-packages/torch/utils/data/dataloader.py", line 505, in __iter__
+    return self._get_iterator()
+           ~~~~~~~~~~~~~~~~~~^^
+  File "/data/venvs/ml/lib/python3.14/site-packages/torch/utils/data/dataloader.py", line 438, in _get_iterator
+    return _MultiProcessingDataLoaderIter(self)
+  File "/data/venvs/ml/lib/python3.14/site-packages/torch/utils/data/dataloader.py", line 1178, in __init__
+    w.start()
+    ~~~~~~~^^
+  File "/usr/lib/python3.14/multiprocessing/process.py", line 121, in start
+    self._popen = self._Popen(self)
+                  ~~~~~~~~~~~^^^^^^
+  File "/usr/lib/python3.14/multiprocessing/context.py", line 230, in _Popen
+    return _default_context.get_context().Process._Popen(process_obj)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^
+  File "/usr/lib/python3.14/multiprocessing/context.py", line 306, in _Popen
+    return Popen(process_obj)
+  File "/usr/lib/python3.14/multiprocessing/popen_forkserver.py", line 35, in __init__
+    super().__init__(process_obj)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^
+  File "/usr/lib/python3.14/multiprocessing/popen_fork.py", line 20, in __init__
+    self._launch(process_obj)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^
+  File "/usr/lib/python3.14/multiprocessing/popen_forkserver.py", line 51, in _launch
+    self.sentinel, w = forkserver.connect_to_new_process(self._fds)
+                       ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^
+  File "/usr/lib/python3.14/multiprocessing/forkserver.py", line 106, in connect_to_new_process
+    connection.answer_challenge(
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+            wrapped_client, self._forkserver_authkey)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.14/multiprocessing/connection.py", line 992, in answer_challenge
+    message = connection.recv_bytes(256)         # reject large message
+  File "/usr/lib/python3.14/multiprocessing/connection.py", line 223, in recv_bytes
+    buf = self._recv_bytes(maxlength)
+  File "/usr/lib/python3.14/multiprocessing/connection.py", line 448, in _recv_bytes
+    buf = self._recv(4)
+  File "/usr/lib/python3.14/multiprocessing/connection.py", line 413, in _recv
+    chunk = read(handle, to_read)
+ConnectionResetError: [Errno 104] Connection reset by peer
+[main.py] train finished in 6.0s (exit code 1)

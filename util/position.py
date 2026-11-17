@@ -1,3 +1,9 @@
+"""2D positional encodings (adapted from DETR).
+
+Role in ESRT: optional position information for the transformer tokens.
+Currently unused; the call in MLABlock is commented out and the classes are only
+imported by model/esrt.py and util/transformer.py.
+"""
 import math
 import torch
 from torch import nn
@@ -22,6 +28,11 @@ class PositionEmbeddingSine(nn.Module):
         self.scale = scale
 
     def forward(self, x):
+        """Return sine/cosine position features, shape (B, 2*num_pos_feats, H, W).
+
+        Here `x` is used as the "not-padded" mask (DETR passes a 0/1 mask): its
+        cumulative sums along H and W give each pixel's row/column index.
+        """
         # x = tensor_list.tensors
         # mask = tensor_list.mask
         # assert mask is not None
@@ -33,11 +44,13 @@ class PositionEmbeddingSine(nn.Module):
             y_embed = y_embed / (y_embed[:, -1:, :] + eps) * self.scale
             x_embed = x_embed / (x_embed[:, :, -1:] + eps) * self.scale
 
+        # Geometric progression of wavelengths, as in "Attention Is All You Need".
         dim_t = torch.arange(self.num_pos_feats, dtype=torch.float32, device=x.device)
         dim_t = self.temperature ** (2 * (dim_t // 2) / self.num_pos_feats)
 
         pos_x = x_embed[:, :, :, None] / dim_t
         pos_y = y_embed[:, :, :, None] / dim_t
+        # Even channels get sin, odd channels get cos; then y and x halves are concatenated.
         pos_x = torch.stack((pos_x[:, :, :, 0::2].sin(), pos_x[:, :, :, 1::2].cos()), dim=4).flatten(3)
         pos_y = torch.stack((pos_y[:, :, :, 0::2].sin(), pos_y[:, :, :, 1::2].cos()), dim=4).flatten(3)
         pos = torch.cat((pos_y, pos_x), dim=3).permute(0, 3, 1, 2)
@@ -55,10 +68,15 @@ class PositionEmbeddingLearned(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self):
+        """Initialise row/column embeddings uniformly in [0, 1)."""
         nn.init.uniform_(self.row_embed.weight)
         nn.init.uniform_(self.col_embed.weight)
 
     def forward(self, x):
+        """Return a learned position map (B, num_pos_feats, H, W) = row emb + column emb.
+
+        Supports feature maps up to 1000 x 1000 (embedding table size).
+        """
         # x = tensor_list.tensors
         h, w = x.shape[-2:]
         i = torch.arange(w, device=x.device)
@@ -76,6 +94,8 @@ class PositionEmbeddingLearned(nn.Module):
 
 
 def build_position_encoding(args):
+    """Build a position encoder from `args.hidden_dim` and `args.position_embedding`
+    ('v2'/'sine' or 'v3'/'learned'). Each of the x and y halves gets hidden_dim // 2 features."""
     N_steps = args.hidden_dim // 2
     if args.position_embedding in ('v2', 'sine'):
         # TODO find a better way of exposing other arguments
