@@ -55,7 +55,12 @@ parser.add_argument("--isY", action="store_true", default=True)  # evaluate PSNR
 parser.add_argument("--ext", type=str, default='.npy')  # training image format: '.npy' (pre-decoded) or '.png'
 parser.add_argument("--phase", type=str, default='train')
 parser.add_argument("--model", type=str, default='ESRT')  # currently unused; ESRT is hard-coded below
-parser.add_argument("--amp", action="store_true", default=False, help="use AMP with fp16 to speed training")
+esrt.add_model_args(parser)  # --freq / --conv / --global_res
+parser.add_argument("--amp", action="store_true", default=True, help="deprecated no-op: bf16 AMP is on by default (CUDA)")
+parser.add_argument("--no_amp", action="store_true", default=False, help="disable bf16 AMP and channels_last (plain fp32 training)")
+parser.add_argument("--val_every", type=int, default=5, help="validate every N epochs (and once after the last epoch)")
+parser.add_argument("--save_dir", type=str, default=None, help="checkpoint folder (default experiment/checkpoint_ESRT_x<scale>[variant]/)")
+utils.add_fast_arg(parser)
 
 def train(epoch, model, optimizer, l1_criterion, training_data_loader, args, device):
     """Run one training epoch over `training_data_loader`.
@@ -66,22 +71,30 @@ def train(epoch, model, optimizer, l1_criterion, training_data_loader, args, dev
     model.train()
     utils.adjust_learning_rate(optimizer, epoch, args.step_size, args.lr, args.gamma)
     print('epoch =', epoch, 'lr = ', optimizer.param_groups[0]['lr'])
+    loss_sum, n_iter = 0.0, 0  # running sum stays on the GPU: no per-iteration sync
     for iteration, (lr_tensor, hr_tensor) in enumerate(training_data_loader, 1):
 
         if args.cuda:
-            lr_tensor = lr_tensor.to(device)  # ranges from [0, 1]
-            hr_tensor = hr_tensor.to(device)  # ranges from [0, 1]
+            lr_tensor = lr_tensor.to(device, non_blocking=True)  # ranges from [0, 1]
+            hr_tensor = hr_tensor.to(device, non_blocking=True)  # ranges from [0, 1]
+            if args.use_amp:
+                lr_tensor = lr_tensor.contiguous(memory_format=torch.channels_last)
 
-        optimizer.zero_grad()
-        sr_tensor = model(lr_tensor)
-        loss_l1 = l1_criterion(sr_tensor, hr_tensor)
+        optimizer.zero_grad(set_to_none=True)
+        with torch.autocast('cuda', dtype=torch.bfloat16, enabled=args.use_amp):
+            sr_tensor = model(lr_tensor)
+        loss_l1 = l1_criterion(sr_tensor.float(), hr_tensor)
         loss_sr = loss_l1
 
         loss_sr.backward()
         optimizer.step()
+        loss_sum += loss_l1.detach()
+        n_iter = iteration
         if iteration % 100 == 0:
             print("===> Epoch[{}]({}/{}): Loss_l1: {:.5f}".format(epoch, iteration, len(training_data_loader),
                                                                   loss_l1.item()))
+    if n_iter:
+        print("===> Epoch[{}] avg Loss_l1: {:.5f}".format(epoch, float(loss_sum) / n_iter))
 def forward_chop(model, x, scale, shave=10, min_size=60000):
     """Memory-saving inference: split the LR image into 4 overlapping quadrants.
 
@@ -141,7 +154,7 @@ def forward_chop(model, x, scale, shave=10, min_size=60000):
 
     return output
 
-def valid(scale, model, testing_data_loader, args, device):
+def valid(scale, model, testing_data_loader, args, device, epochs_trained=0):
     """Evaluate on the validation set and print mean PSNR / SSIM.
 
     Images are super-resolved with forward_chop, shaved by `scale` border
@@ -153,10 +166,10 @@ def valid(scale, model, testing_data_loader, args, device):
     for batch in testing_data_loader:
         lr_tensor, hr_tensor = batch[0], batch[1]
         if args.cuda:
-            lr_tensor = lr_tensor.to(device)
-            hr_tensor = hr_tensor.to(device)
+            lr_tensor = lr_tensor.to(device, non_blocking=True)
+            hr_tensor = hr_tensor.to(device, non_blocking=True)
 
-        with torch.no_grad():
+        with torch.inference_mode():
             pre = forward_chop(model, lr_tensor, scale)#model(lr_tensor)
 
         sr_img = utils.tensor2np(pre.detach()[0])
@@ -174,12 +187,14 @@ def valid(scale, model, testing_data_loader, args, device):
         # print(im_label.shape)
         avg_psnr += utils.compute_psnr(im_pre, im_label)
         avg_ssim += utils.compute_ssim(im_pre, im_label)
-    print("===> Valid. psnr: {:.4f}, ssim: {:.4f}".format(avg_psnr / len(testing_data_loader), avg_ssim / len(testing_data_loader)))
+    print("===> Valid. psnr: {:.4f}, ssim: {:.4f} (weights after {} epochs)".format(
+        avg_psnr / len(testing_data_loader), avg_ssim / len(testing_data_loader), epochs_trained))
 
 
 def save_checkpoint(epoch, model, args):
     """Save the model weights to experiment/checkpoint_ESRT_x<scale>/epoch_<epoch>.pth."""
-    model_folder = "experiment/checkpoint_ESRT_x{}/".format(args.scale)
+    model_folder = args.save_dir or "experiment/checkpoint_ESRT_x{}{}/".format(args.scale, esrt.variant_tag(args))
+    model_folder = model_folder.rstrip("/") + "/"
     model_out_path = model_folder + "epoch_{}.pth".format(epoch)
     if not os.path.exists(model_folder):
         os.makedirs(model_folder)
@@ -198,7 +213,10 @@ def print_network(net):
 def main():
     args = parser.parse_args()
     print(args)
-    torch.backends.cudnn.benchmark = True  # autotune conv algorithms (fixed-size training patches)
+    args.use_amp = bool(args.cuda and torch.cuda.is_available() and not args.no_amp)
+    if args.val_every < 1:
+        parser.error("--val_every must be >= 1")
+    torch.backends.cudnn.benchmark = args.use_amp  # autotune conv algorithms (fixed-size training patches)
     # random seed
     seed = args.seed
     if seed is None:
@@ -218,21 +236,28 @@ def main():
     testset = Set5_val.DatasetFromFolderVal("Test_Datasets/Set5/",
                                            "Test_Datasets/Set5_LR/x{}/".format(args.scale),
                                            args.scale)
-    training_data_loader = DataLoader(dataset=trainset, num_workers=args.threads, batch_size=args.batch_size, shuffle=True, pin_memory=True, drop_last=True)
+    training_data_loader = DataLoader(dataset=trainset, num_workers=args.threads, batch_size=args.batch_size, shuffle=True, pin_memory=True, drop_last=True,
+                                     persistent_workers=args.threads > 0)
     testing_data_loader = DataLoader(dataset=testset, num_workers=args.threads, batch_size=args.testBatchSize,
-                                     shuffle=False)
+                                     shuffle=False, pin_memory=True, persistent_workers=args.threads > 0)
 
     print("===> Building models")
     args.is_train = True
 
 
-    model = esrt.ESRT(upscale = args.scale)#architecture.IMDN(upscale=args.scale)
+    try:
+        model = esrt.ESRT(upscale = args.scale, **esrt.model_kwargs(args))
+    except ValueError as e:
+        parser.error(str(e))
+    #architecture.IMDN(upscale=args.scale)
 
     l1_criterion = nn.L1Loss()
 
     print("===> Setting GPU")
     if cuda:
         model = model.to(device)
+        if args.use_amp:
+            model = model.to(memory_format=torch.channels_last)
         l1_criterion = l1_criterion.to(device)
 
     # Optionally initialise from a checkpoint (supports DataParallel 'module.' prefixes).
@@ -263,7 +288,16 @@ def main():
 
     print("===> Setting Optimizer")
 
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = optim.Adam(model.parameters(), lr=args.lr, fused=bool(cuda and torch.cuda.is_available()))
+
+    # --fast: compile for training (checkpoints/validation keep using the plain `model`).
+    train_model = model
+    if args.fast and cuda:
+        lp = args.patch_size // args.scale
+        example = torch.rand(args.batch_size, 3, lp, lp, device=device)
+        if args.use_amp:
+            example = example.contiguous(memory_format=torch.channels_last)
+        train_model = utils.compile_model(model, example, train=True, autocast=args.use_amp)
 
 
 
@@ -276,9 +310,10 @@ def main():
     for epoch in range(args.start_epoch, args.nEpochs + 1):
         t_epoch_start = timer.t()
         epoch_start = datetime.datetime.now()
-        valid(args.scale, model, testing_data_loader, args, device)
-        train(epoch, model, optimizer, l1_criterion, training_data_loader, args, device)
-        if epoch%10==0:
+        if (epoch - args.start_epoch) % args.val_every == 0:
+            valid(args.scale, model, testing_data_loader, args, device, epoch - 1)
+        train(epoch, train_model, optimizer, l1_criterion, training_data_loader, args, device)
+        if epoch%10==0 or epoch == args.nEpochs:  # always keep the final epoch
             save_checkpoint(epoch, model, args)
         epoch_end = datetime.datetime.now()
         print('Epoch cost times: %s' % str(epoch_end-epoch_start))
@@ -289,6 +324,7 @@ def main():
         t_epoch = utils.time_text(t - t_epoch_start)
         t_elapsed, t_all = utils.time_text(t), utils.time_text(t / prog)
         print('{} {}/{}'.format(t_epoch, t_elapsed, t_all))
+    valid(args.scale, model, testing_data_loader, args, device, args.nEpochs)  # score the final weights
     code_end = datetime.datetime.now()
     print('Code cost times: %s' % str(code_end-code_start))
 

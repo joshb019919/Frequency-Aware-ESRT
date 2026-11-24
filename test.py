@@ -27,6 +27,8 @@ parser.add_argument("--test_hr_folder", type=str, default='Test_Datasets/Set5/',
 parser.add_argument("--test_lr_folder", type=str, default='Test_Datasets/Set5_LR/x2/',
                     help='the folder of the input images')
 parser.add_argument("--output_folder", type=str, default='results/Set5/x2')
+utils.add_fast_arg(parser)
+esrt.add_model_args(parser)  # must match the flags the checkpoint was trained with
 parser.add_argument("--checkpoint", type=str, default='checkpoints/IMDN_x2.pth',
                     help='checkpoint folder to use')
 parser.add_argument('--cuda', action='store_true', default=True,
@@ -99,13 +101,11 @@ def forward_chop(model, x, scale, shave=10, min_size=60000):
 cuda = opt.cuda
 device = torch.device('cuda' if cuda else 'cpu')
 
-# Set5/Set14 ship as .bmp; other benchmarks as .png. The folder name is taken
-# from the second-to-last path component, so --test_hr_folder needs a trailing '/'.
+# Benchmarks ship as .png or .bmp (e.g. original Set5/Set14 are .bmp); detect which
+# one the HR and LR folders actually contain instead of guessing from the folder name.
 filepath = opt.test_hr_folder
-if filepath.split('/')[-2] == 'Set5' or filepath.split('/')[-2] == 'Set14':
-    ext = '.bmp'
-else:
-    ext = '.png'
+ext = utils.detect_image_ext(filepath)
+lr_ext = utils.detect_image_ext(opt.test_lr_folder)
 
 filelist = utils.get_list(filepath, ext=ext)
 # Per-image metrics, averaged at the end.
@@ -115,9 +115,23 @@ time_list = np.zeros(len(filelist))
 
 # Build the model and load weights (utils strips any DataParallel 'module.'
 # prefix; ESRT.load_state_dict tolerates missing/extra keys with strict=False).
-model =  esrt.ESRT(upscale = opt.upscale_factor)#
+try:
+    model = esrt.ESRT(upscale = opt.upscale_factor, **esrt.model_kwargs(opt))
+except ValueError as e:
+    parser.error(str(e))
 model_dict = utils.load_state_dict(opt.checkpoint)
+# Fail loudly if the checkpoint was trained with different --freq/--conv/--global_res flags.
+_missing = [k for k in model.state_dict() if k not in model_dict and 'tail' not in k]
+if _missing:
+    raise SystemExit("Checkpoint is missing {} model keys (e.g. {}); pass the same "
+                     "--freq/--conv/--global_res flags used for training.".format(len(_missing), _missing[0]))
 model.load_state_dict(model_dict, strict=False)#True)
+model.eval()
+if cuda:
+    model = model.to(device).to(memory_format=torch.channels_last)
+if opt.fast and cuda:
+    model = utils.compile_model(model, torch.rand(1, 3, 64, 64, device=device).contiguous(memory_format=torch.channels_last),
+                                autocast=True, dynamic=True)
 
 i = 0
 # CUDA events for accurate GPU timing of the forward pass.
@@ -129,7 +143,7 @@ for imname in filelist:
     # Crop HR so its size is divisible by the scale (matches the LR image size).
     im_gt = utils.modcrop(im_gt, opt.upscale_factor)
     # LR file name convention: <name>x<scale><ext>
-    im_l = cv2.imread(opt.test_lr_folder + imname.split('/')[-1].split('.')[0] + 'x' + str(opt.upscale_factor) + ext, cv2.IMREAD_COLOR)[:, :, [2, 1, 0]]  # BGR to RGB
+    im_l = cv2.imread(opt.test_lr_folder + imname.split('/')[-1].split('.')[0] + 'x' + str(opt.upscale_factor) + lr_ext, cv2.IMREAD_COLOR)[:, :, [2, 1, 0]]  # BGR to RGB
     # Grayscale fallback: replicate to 3 channels. (cv2.IMREAD_COLOR always
     # returns 3 channels, so this branch is effectively never taken.)
     if len(im_gt.shape) < 3:
@@ -144,10 +158,9 @@ for imname in filelist:
     im_input = torch.from_numpy(im_input).float()
 
     if cuda:
-        model = model.to(device)
         im_input = im_input.to(device)
 
-    with torch.no_grad():
+    with torch.inference_mode(), torch.autocast('cuda', dtype=torch.bfloat16, enabled=bool(opt.fast and cuda)):
         start.record()
         out = forward_chop(model, im_input, opt.upscale_factor) #model(im_input)
         end.record()
