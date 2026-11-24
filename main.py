@@ -36,6 +36,8 @@ def main():
     mode = p.add_mutually_exclusive_group(required=True)
     mode.add_argument("--train", action="store_true", help="run train.py")
     mode.add_argument("--test", action="store_true", help="run test.py")
+    mode.add_argument("--experiments", action="store_true",
+                      help="run experiments.py (train+test every variant); extra args after -- go to it")
     p.add_argument("--hf_repo", default=None, help="HF dataset repo id, e.g. user/name")
     p.add_argument("--hf_revision", default=None, help="branch/tag/commit")
     p.add_argument("--data_dir", default=os.path.join(ROOT, "dataset"),
@@ -48,6 +50,11 @@ def main():
     p.add_argument("--test_lr_folder")
     p.add_argument("--checkpoint")
     p.add_argument("--output_folder")
+    # model variant flags, forwarded to train.py/test.py only when given
+    p.add_argument("--freq", choices=["lowpass", "dwt"])
+    p.add_argument("--conv", choices=["1", "3", "band"])
+    p.add_argument("--global_res", choices=["0", "1"])
+    p.add_argument("--fast", action="store_true", help="forward --fast (torch.compile + bf16 inference)")
 
     # Unknown args are kept in `extra` and passed through to the child script.
     args, extra = p.parse_known_args()
@@ -72,6 +79,9 @@ def main():
     if args.train:
         cmd = [sys.executable, os.path.join(ROOT, "train.py"),
                "--root", args.data_dir, "--scale", str(args.scale)]
+    elif args.experiments:
+        cmd = [sys.executable, os.path.join(ROOT, "experiments.py"),
+               "--root", args.data_dir, "--scale", str(args.scale)]
     else:
         if not (args.test_hr_folder and args.test_lr_folder and args.checkpoint):
             p.error("--test needs --test_hr_folder, --test_lr_folder and --checkpoint")
@@ -84,6 +94,11 @@ def main():
         if args.output_folder:
             cmd += ["--output_folder", args.output_folder]
 
+    for flag in (() if args.experiments else ("freq", "conv", "global_res")):
+        if getattr(args, flag) is not None:
+            cmd += ["--" + flag, getattr(args, flag)]
+    if args.fast:
+        cmd.append("--fast")
     cmd += extra  # user-supplied passthrough flags go last so they can override
     print("Running:", " ".join(cmd))
 
@@ -91,7 +106,7 @@ def main():
     rc = subprocess.call(cmd, cwd=ROOT)
     elapsed = time.perf_counter() - start
 
-    mode = "train" if args.train else "test"
+    mode = "train" if args.train else "experiments" if args.experiments else "test"
     print("[main.py] {} finished in {:.1f}s (exit code {})".format(mode, elapsed, rc))
     
     # Append one tab-separated record per run: timestamp, mode, scale, duration, rc.
