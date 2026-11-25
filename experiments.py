@@ -6,6 +6,8 @@ settings, evaluated with test.py, and appended to a results CSV. A failed config
 recorded and does not stop the others.
 
 Configs (7 per patch size): lowpass; dwt with --conv {1,3,band} x --global_res {1,0}.
+--dwt_tweaks skip,norm,skipnorm adds the dwt configs again with the architectural tweaks
+(--dwt_skip 1 / --ll_norm 1 / both), named <config>_<tweak>; `skip` is not run for conv band.
 --patch_size {96,144,both} (default 96) sets the HR training patch; `both` runs every
 config at 96 and at 144. Names at 144 get a `_p144` suffix (96 keeps the plain name).
 
@@ -34,17 +36,35 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 PATCH_SIZES = (96, 144)  # HR training patch sizes; 96 is the default
 
 
-def build_configs(patch_sizes=(96,)):
+TWEAKS = {"skip": ["--dwt_skip", "1"], "norm": ["--ll_norm", "1"],
+          "skipnorm": ["--dwt_skip", "1", "--ll_norm", "1"]}
+
+
+def build_configs(patch_sizes=(96,), tweaks=()):
     """Return [(name, [flags...], patch)] for every variant x patch size.
 
     Variants: lowpass + dwt x conv x global_res. A patch size other than 96 adds a
     `_p<patch>` suffix to the name so checkpoints/logs never collide.
     """
     base = [("lowpass", [])]
-    for conv, gr in itertools.product(["1", "3", "band"], ["1", "0"]):
+    # gr0 variants disabled: 10-epoch results showed global_res=0 is clearly worse
+    # (re-add "0" to the list to run them again).
+    for conv, gr in itertools.product(["1", "3", "band"], ["1"]):  # , "0"]):
         base.append(("dwt_c{}_gr{}".format(conv, gr),
                      ["--freq", "dwt", "--conv", conv, "--global_res", gr]))
-    return [(n + ("" if ps == 96 else "_p{}".format(ps)), f, ps) for ps in patch_sizes for n, f in base]
+    cfgs = []
+    for ps in patch_sizes:
+        suffix = "" if ps == 96 else "_p{}".format(ps)
+        cfgs += [(n + suffix, f, ps) for n, f in base]
+        for tw in tweaks:  # architectural tweaks apply to the dwt configs only
+            for n, f in base[1:]:
+                if tw == "skip" and "band" in f:
+                    continue  # band's decoder_high already has an internal residual: skip is a no-op
+                # c1_skipnorm disabled: PSNR regressed (34.40 vs 34.90 basic) despite high SSIM.
+                if tw == "skipnorm" and n == "dwt_c1_gr1":
+                    continue
+                cfgs.append(("{}_{}{}".format(n, tw, suffix), f + TWEAKS[tw], ps))
+    return cfgs
 
 
 def exp_dir(name):
@@ -61,8 +81,7 @@ def train_cmd(name, flags, a, patch=96):
            "--patch_size", str(patch), "--threads", str(a.threads),
            "--seed", str(a.seed), "--val_every", str(a.val_every),
            "--save_dir", exp_dir(name)] + flags
-    if a.fast:
-        cmd.append("--fast")
+    cmd.append("--fast" if a.fast else "--no-fast")
     if a.no_amp:
         cmd.append("--no_amp")
     return cmd
@@ -75,8 +94,7 @@ def test_cmd(name, flags, a):
            "--test_lr_folder", lr, "--checkpoint", checkpoint_path(name, a.epochs),
            "--upscale_factor", str(a.scale),
            "--output_folder", os.path.join("results", "exp_" + name)] + flags
-    if a.fast:
-        cmd.append("--fast")
+    cmd.append("--fast" if a.fast else "--no-fast")
     return cmd
 
 
@@ -211,8 +229,11 @@ def main(argv=None):
     p.add_argument("--val_every", type=int, default=5)
     p.add_argument("--test_hr_folder", default="Test_Datasets/Set5/")
     p.add_argument("--test_lr_folder", default=None)
+    p.add_argument("--dwt_tweaks", default="",
+                   help="comma-separated subset of {}: also run the dwt configs with these tweaks".format(",".join(TWEAKS)))
     p.add_argument("--only", default=None, help="comma-separated config names")
-    p.add_argument("--fast", action="store_true", help="pass --fast to train/test")
+    p.add_argument("--fast", action=argparse.BooleanOptionalAction, default=True,
+                   help="torch.compile + bf16 + TF32 in train/test (default on; --no-fast disables)")
     p.add_argument("--no_amp", action="store_true", help="plain fp32 training")
     p.add_argument("--force", action="store_true", help="retrain even if the final checkpoint exists")
     p.add_argument("--from_logs", action="store_true",
@@ -231,7 +252,10 @@ def main(argv=None):
         print("{} log(s) -> {}".format(len(logs), out if logs else "nothing written"))
         return 0
 
-    cfgs = build_configs(PATCH_SIZES if a.patch_size == "both" else (int(a.patch_size),))
+    tweaks = tuple(t for t in a.dwt_tweaks.split(",") if t)
+    if set(tweaks) - set(TWEAKS):
+        p.error("--dwt_tweaks must be a comma-separated subset of {}".format(sorted(TWEAKS)))
+    cfgs = build_configs(PATCH_SIZES if a.patch_size == "both" else (int(a.patch_size),), tweaks)
     if a.scale not in (2, 3, 4) or any(ps % a.scale for _, _, ps in cfgs):
         p.error("patch size must be divisible by --scale")
     if a.only:

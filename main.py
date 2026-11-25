@@ -86,13 +86,15 @@ def main():
         cmd = [sys.executable, os.path.join(ROOT, "experiments.py"),
                "--root", args.data_dir, "--scale", str(args.scale)]
     else:
-        if not (args.test_hr_folder and args.test_lr_folder and args.checkpoint):
-            p.error("--test needs --test_hr_folder, --test_lr_folder and --checkpoint")
+        if not args.checkpoint or bool(args.test_hr_folder) != bool(args.test_lr_folder):
+            p.error("--test needs --checkpoint (and --test_hr_folder with --test_lr_folder, or neither "
+                    "to use test.py's default sets, bsds300 + manga109)")
         cmd = [sys.executable, os.path.join(ROOT, "test.py"),
-               "--test_hr_folder", in_data(args.test_hr_folder),
-               "--test_lr_folder", in_data(args.test_lr_folder),
                "--checkpoint", args.checkpoint,
                "--upscale_factor", str(args.scale)]
+        if args.test_hr_folder:
+            cmd += ["--test_hr_folder", in_data(args.test_hr_folder),
+                    "--test_lr_folder", in_data(args.test_lr_folder)]
         
         if args.output_folder:
             cmd += ["--output_folder", args.output_folder]
