@@ -216,6 +216,7 @@ def main():
     args.use_amp = bool(args.cuda and torch.cuda.is_available() and not args.no_amp)
     if args.val_every < 1:
         parser.error("--val_every must be >= 1")
+    utils.enable_tf32(args.use_amp)
     torch.backends.cudnn.benchmark = args.use_amp  # autotune conv algorithms (fixed-size training patches)
     # random seed
     seed = args.seed
@@ -297,7 +298,8 @@ def main():
         example = torch.rand(args.batch_size, 3, lp, lp, device=device)
         if args.use_amp:
             example = example.contiguous(memory_format=torch.channels_last)
-        train_model = utils.compile_model(model, example, train=True, autocast=args.use_amp)
+        train_model = utils.compile_model(model, example, train=True, autocast=args.use_amp,
+                                         mode=args.compile_mode)
 
 
 

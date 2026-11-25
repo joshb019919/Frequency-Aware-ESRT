@@ -92,6 +92,7 @@ def main():
     except ValueError as e:
         p.error(str(e))
     amp = dev.type == 'cuda' and not a.no_amp
+    utils.enable_tf32(amp)
     torch.backends.cudnn.benchmark = amp
     if amp:
         model = model.to(memory_format=torch.channels_last)
@@ -104,7 +105,7 @@ def main():
     x = torch.rand(1, 3, *a.lr_size, device=dev).contiguous(memory_format=cl)
     infer_model = model
     if a.fast and dev.type == 'cuda':
-        infer_model = utils.compile_model(model, x, autocast=True)
+        infer_model = utils.compile_model(model, x, autocast=True, mode=a.compile_mode)
     if dev.type == "cuda":
         torch.cuda.reset_peak_memory_stats()
     with torch.inference_mode(), torch.autocast('cuda', dtype=torch.bfloat16, enabled=bool(a.fast and dev.type == 'cuda')):
@@ -121,7 +122,7 @@ def main():
     opt = torch.optim.Adam(model.parameters(), lr=2e-4, fused=dev.type == 'cuda')
     train_model = model
     if a.fast and dev.type == 'cuda':
-        train_model = utils.compile_model(model, xb, train=True, autocast=amp)
+        train_model = utils.compile_model(model, xb, train=True, autocast=amp, mode=a.compile_mode)
     crit = nn.L1Loss()
 
     def step():

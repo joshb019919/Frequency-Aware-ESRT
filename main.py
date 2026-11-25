@@ -54,7 +54,10 @@ def main():
     p.add_argument("--freq", choices=["lowpass", "dwt"])
     p.add_argument("--conv", choices=["1", "3", "band"])
     p.add_argument("--global_res", choices=["0", "1"])
-    p.add_argument("--fast", action="store_true", help="forward --fast (torch.compile + bf16 inference)")
+    p.add_argument("--dwt_skip", choices=["0", "1"])
+    p.add_argument("--ll_norm", choices=["0", "1"])
+    p.add_argument("--fast", action=argparse.BooleanOptionalAction, default=True,
+                   help="torch.compile + bf16 + TF32 (default on; --no-fast disables)")
 
     # Unknown args are kept in `extra` and passed through to the child script.
     args, extra = p.parse_known_args()
@@ -94,11 +97,10 @@ def main():
         if args.output_folder:
             cmd += ["--output_folder", args.output_folder]
 
-    for flag in (() if args.experiments else ("freq", "conv", "global_res")):
+    for flag in (() if args.experiments else ("freq", "conv", "global_res", "dwt_skip", "ll_norm")):
         if getattr(args, flag) is not None:
             cmd += ["--" + flag, getattr(args, flag)]
-    if args.fast:
-        cmd.append("--fast")
+    cmd.append("--fast" if args.fast else "--no-fast")
     cmd += extra  # user-supplied passthrough flags go last so they can override
     print("Running:", " ".join(cmd))
 
