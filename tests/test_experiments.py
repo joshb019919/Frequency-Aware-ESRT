@@ -131,3 +131,16 @@ def test_run_logged_streams_and_echoes(tmp_path, capsys):
     out = capsys.readouterr().out
     assert rc == 0 and "noise" in log.read_text() and "noise" not in out
     assert "[t] epoch = 1 lr = 0.1" in out and "[t] ===> Epoch[1] avg Loss_l1: 0.5" in out
+
+
+def test_tweak_configs():
+    cfgs = experiments.build_configs((96,), ("skip", "norm", "skipnorm"))
+    names = [n for n, _, _ in cfgs]
+    assert len(names) == len(set(names)) == 7 + 4 + 6 + 6      # skip is not run for band
+    d = {n: f for n, f, _ in cfgs}
+    assert d["dwt_c1_gr1_skip"][-2:] == ["--dwt_skip", "1"] and "dwt_cband_gr1_skip" not in d
+    assert d["dwt_cband_gr0_norm"][-2:] == ["--ll_norm", "1"]
+    assert d["dwt_c3_gr1_skipnorm"][-4:] == ["--dwt_skip", "1", "--ll_norm", "1"]
+    p144 = experiments.build_configs((144,), ("norm",))
+    assert "dwt_c1_gr1_norm_p144" in [n for n, _, _ in p144]
+    assert [n for n, _, _ in experiments.build_configs()] == [n for n, _, _ in experiments.build_configs((96,), ())]

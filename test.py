@@ -127,11 +127,12 @@ if _missing:
                      "--freq/--conv/--global_res flags used for training.".format(len(_missing), _missing[0]))
 model.load_state_dict(model_dict, strict=False)#True)
 model.eval()
+utils.enable_tf32(opt.fast and cuda)
 if cuda:
     model = model.to(device).to(memory_format=torch.channels_last)
-if opt.fast and cuda:
-    model = utils.compile_model(model, torch.rand(1, 3, 64, 64, device=device).contiguous(memory_format=torch.channels_last),
-                                autocast=True, dynamic=True)
+# --fast at test time = bf16 autocast + TF32 only. torch.compile is deliberately not used here:
+# dynamic=True fails in inductor for the DWT models (Triton int64 error, falls back to eager), and
+# static shapes recompile per distinct tile size, which costs far more than the ~1 s Set5 run.
 
 i = 0
 # CUDA events for accurate GPU timing of the forward pass.
