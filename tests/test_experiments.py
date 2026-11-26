@@ -103,7 +103,8 @@ def test_parse_train_log_per_epoch_rows():
     rows = experiments.parse_train_log(SAMPLE_LOG)
     assert [r["epoch"] for r in rows] == [0, 1, 2]
     assert rows[0]["val_psnr"] == 12.8 and rows[0]["train_loss_l1"] is None   # untrained weights
-    assert rows[1] == dict(epoch=1, lr=0.0002, train_loss_l1=0.08123, epoch_s=65.5, val_psnr=None, val_ssim=None)
+    assert rows[1] == dict(epoch=1, lr=0.0002, train_loss_l1=0.08123, epoch_s=65.5, val_psnr=None, val_ssim=None,
+                        train_loss_freq=None)  # plain-L1 log: no frequency term
     assert rows[2]["val_psnr"] == 30.5 and rows[2]["train_loss_l1"] == 0.05 and rows[2]["epoch_s"] == 6.2
 
 
@@ -120,7 +121,7 @@ def test_from_logs_writes_csv(tmp_path, monkeypatch):
     (d / "train.log").write_text(SAMPLE_LOG)
     assert experiments.main(["--from_logs"]) == 0
     out = list((tmp_path / "experiment").glob("epochs_*.csv"))[0].read_text().splitlines()
-    assert out[0] == "name,epoch,lr,train_loss_l1,epoch_s,val_psnr,val_ssim" and len(out) == 4
+    assert out[0] == "name,epoch,lr,train_loss_l1,epoch_s,val_psnr,val_ssim,train_loss_freq" and len(out) == 4
     assert out[2].startswith("lowpass,1,0.0002,0.08123,65.5")
 
 

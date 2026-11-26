@@ -6,7 +6,7 @@ Role in ESRT: the training entry point. It wires together the data pipeline
 Script-style entry point (everything runs inside main(), under an
 `if __name__ == '__main__':` guard so DataLoader worker processes started with
 the 'spawn'/'forkserver' method can re-import this file safely): parses CLI
-args, builds the DIV2K training loader and the validation loaders (--val_sets, default set14+set5), trains with L1 loss + Adam and a
+args, builds the DIV2K training loader and the validation loaders (--val_sets, default set14+set5), trains with L1 loss (+ optional FFT-L1 term, --freq_loss_lambda) + Adam and a
 step-decay LR schedule, validates (Y-channel PSNR/SSIM) every epoch and saves a
 checkpoint every 10 epochs to experiment/checkpoint_ESRT_x<scale>/.
 
@@ -20,6 +20,7 @@ from torch.utils.data import DataLoader
 from model import esrt
 from data import DIV2K, benchmarks
 import metrics_freq
+import losses
 import plotting
 import utils
 import skimage.color as sc
@@ -71,18 +72,29 @@ parser.add_argument("--bench_root", type=str, default=benchmarks.DEFAULT_BENCH_R
 parser.add_argument("--plot", action=argparse.BooleanOptionalAction, default=True,
                     help="write <save_dir>/curves.png (train loss | val PSNR | val SSIM), updated at each validation")
 metrics_freq.add_args(parser)  # --hf_metrics / --perceptual / --wavelets
+parser.add_argument("--freq_loss_lambda", type=float, default=0.0,
+                    help="weight of the FFT-L1 frequency loss term added to L1 (0 = plain L1; proposal: 0.01/0.05/0.1)")
 utils.add_fast_arg(parser)
 
-def train(epoch, model, optimizer, l1_criterion, training_data_loader, args, device):
+def default_save_dir(args):
+    """experiment/checkpoint_ESRT_x<scale>[model variant][_fl<lambda>] (no trailing slash)."""
+    return "experiment/checkpoint_ESRT_x{}{}{}".format(
+        args.scale, esrt.variant_tag(args), losses.loss_tag(getattr(args, "freq_loss_lambda", 0.0)))
+
+
+def train(epoch, model, optimizer, criterion, training_data_loader, args, device):
     """Run one training epoch over `training_data_loader`.
 
-    Applies the step-decay LR schedule for `epoch`, then optimises the L1 loss
-    between the model output and the HR patch, logging every 100 iterations.
+    Applies the step-decay LR schedule for `epoch`, then optimises `criterion` between
+    the model output and the HR patch, logging every 100 iterations. `criterion` is
+    either a plain loss (e.g. nn.L1Loss) or losses.FrequencyAwareLoss, which returns
+    (total, l1, freq). Returns the epoch's mean L1 (comparable across lambdas).
     """
     model.train()
     utils.adjust_learning_rate(optimizer, epoch, args.step_size, args.lr, args.gamma)
     print('epoch =', epoch, 'lr = ', optimizer.param_groups[0]['lr'])
-    loss_sum, n_iter = 0.0, 0  # running sum stays on the GPU: no per-iteration sync
+    loss_sum, freq_sum, n_iter = 0.0, 0.0, 0  # running sums stay on the GPU: no per-iteration sync
+    has_freq = getattr(criterion, "freq_lambda", 0) > 0
     for iteration, (lr_tensor, hr_tensor) in enumerate(training_data_loader, 1):
 
         if args.cuda:
@@ -94,19 +106,26 @@ def train(epoch, model, optimizer, l1_criterion, training_data_loader, args, dev
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast('cuda', dtype=torch.bfloat16, enabled=args.use_amp):
             sr_tensor = model(lr_tensor)
-        loss_l1 = l1_criterion(sr_tensor.float(), hr_tensor)
-        loss_sr = loss_l1
+        out = criterion(sr_tensor.float(), hr_tensor)
+        loss_sr, loss_l1, loss_freq = out if isinstance(out, tuple) else (out, out, None)
 
         loss_sr.backward()
         optimizer.step()
         loss_sum += loss_l1.detach()
+        if has_freq:
+            freq_sum += loss_freq.detach()
         n_iter = iteration
         if iteration % 100 == 0:
-            print("===> Epoch[{}]({}/{}): Loss_l1: {:.5f}".format(epoch, iteration, len(training_data_loader),
-                                                                  loss_l1.item()))
+            msg = "===> Epoch[{}]({}/{}): Loss_l1: {:.5f}".format(epoch, iteration, len(training_data_loader),
+                                                                 loss_l1.item())
+            if has_freq:
+                msg += " Loss_freq: {:.5f}".format(loss_freq.item())
+            print(msg)
     if n_iter:
         avg = float(loss_sum) / n_iter
         print("===> Epoch[{}] avg Loss_l1: {:.5f}".format(epoch, avg))
+        if has_freq:
+            print("===> Epoch[{}] avg Loss_freq: {:.5f}".format(epoch, float(freq_sum) / n_iter))
         return avg
 def forward_chop(model, x, scale, shave=10, min_size=60000):
     """Memory-saving inference: split the LR image into 4 overlapping quadrants.
@@ -234,8 +253,7 @@ def valid(scale, model, loaders, args, device, epochs_trained=0, freq_eval=None,
 
 def save_checkpoint(epoch, model, args):
     """Save the model weights to experiment/checkpoint_ESRT_x<scale>/epoch_<epoch>.pth."""
-    model_folder = args.save_dir or "experiment/checkpoint_ESRT_x{}{}/".format(args.scale, esrt.variant_tag(args))
-    model_folder = model_folder.rstrip("/") + "/"
+    model_folder = (args.save_dir or default_save_dir(args)).rstrip("/") + "/"
     model_out_path = model_folder + "epoch_{}.pth".format(epoch)
     if not os.path.exists(model_folder):
         os.makedirs(model_folder)
@@ -305,14 +323,19 @@ def main():
         parser.error(str(e))
     #architecture.IMDN(upscale=args.scale)
 
-    l1_criterion = nn.L1Loss()
+    try:  # L1, plus lambda * FFT-L1 when --freq_loss_lambda > 0
+        criterion = losses.FrequencyAwareLoss(args.freq_loss_lambda)
+    except ValueError as e:
+        parser.error(str(e))
+    print("===> Loss: L1{}".format(
+        " + {:g} * FFT-L1".format(args.freq_loss_lambda) if args.freq_loss_lambda else ""))
 
     print("===> Setting GPU")
     if cuda:
         model = model.to(device)
         if args.use_amp:
             model = model.to(memory_format=torch.channels_last)
-        l1_criterion = l1_criterion.to(device)
+        criterion = criterion.to(device)
 
     # Optionally initialise from a checkpoint (supports DataParallel 'module.' prefixes).
     if args.pretrained:
@@ -360,7 +383,7 @@ def main():
     print_network(model)
     code_start = datetime.datetime.now()
     timer = utils.Timer()
-    save_dir = (args.save_dir or "experiment/checkpoint_ESRT_x{}{}/".format(args.scale, esrt.variant_tag(args))).rstrip("/")
+    save_dir = (args.save_dir or default_save_dir(args)).rstrip("/")
     plotter = plotting.TrainValPlotter(save_dir, title=os.path.basename(save_dir),
                                        reference=plotting.load_reference(args.ref_history) if args.ref_history else None) if args.plot else None
     # Main loop. Note validation runs *before* training each epoch, so the reported
@@ -375,7 +398,7 @@ def main():
                 plotter.add_val(epoch - 1, res)
                 plotter.add_freq(epoch - 1, extras)
                 plotter.save()
-        loss = train(epoch, train_model, optimizer, l1_criterion, training_data_loader, args, device)
+        loss = train(epoch, train_model, optimizer, criterion, training_data_loader, args, device)
         if plotter:
             plotter.add_loss(epoch, loss)
         if epoch%10==0 or epoch == args.nEpochs:  # always keep the final epoch

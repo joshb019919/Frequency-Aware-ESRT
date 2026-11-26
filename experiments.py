@@ -8,6 +8,8 @@ recorded and does not stop the others.
 Configs (7 per patch size): lowpass; dwt with --conv {1,3,band} x --global_res {1,0}.
 --dwt_tweaks skip,norm,skipnorm adds the dwt configs again with the architectural tweaks
 (--dwt_skip 1 / --ll_norm 1 / both), named <config>_<tweak>; `skip` is not run for conv band.
+--freq_lambdas 0.01,0.05,0.1 adds every config again trained with L1 + lambda * FFT-L1
+(losses.py), named <config>_fl<lambda>.
 --patch_size {96,144,both} (default 96) sets the HR training patch; `both` runs every
 config at 96 and at 144. Names at 144 get a `_p144` suffix (96 keeps the plain name).
 
@@ -35,6 +37,8 @@ import subprocess
 import sys
 import time
 
+from losses import loss_tag
+
 ROOT = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -45,11 +49,13 @@ TWEAKS = {"skip": ["--dwt_skip", "1"], "norm": ["--ll_norm", "1"],
           "skipnorm": ["--dwt_skip", "1", "--ll_norm", "1"]}
 
 
-def build_configs(patch_sizes=(96,), tweaks=()):
+def build_configs(patch_sizes=(96,), tweaks=(), freq_lambdas=()):
     """Return [(name, [flags...], patch)] for every variant x patch size.
 
     Variants: lowpass + dwt x conv x global_res. A patch size other than 96 adds a
-    `_p<patch>` suffix to the name so checkpoints/logs never collide.
+    `_p<patch>` suffix to the name so checkpoints/logs never collide. Each lambda in
+    `freq_lambdas` adds a copy of every config trained with that frequency-loss weight,
+    named <config>_fl<lambda>.
     """
     base = [("lowpass", [])]
     # gr0 variants disabled: 10-epoch results showed global_res=0 is clearly worse
@@ -69,7 +75,26 @@ def build_configs(patch_sizes=(96,), tweaks=()):
                 if tw == "skipnorm" and n == "dwt_c1_gr1":
                     continue
                 cfgs.append(("{}_{}{}".format(n, tw, suffix), f + TWEAKS[tw], ps))
+    # Frequency-loss copies of every config so far (V1 = lowpass + loss, V3 = dwt + loss).
+    cfgs += [(n + loss_tag(lam), f + ["--freq_loss_lambda", "{:g}".format(lam)], ps)
+             for lam in freq_lambdas for n, f, ps in list(cfgs)]
     return cfgs
+
+
+TRAIN_ONLY_FLAGS = ("--freq_loss_lambda",)  # one value each; test.py does not accept them
+
+
+def model_flags(flags):
+    """`flags` minus the training-only ones, i.e. what test.py needs to rebuild the model."""
+    out, skip = [], False
+    for tok in flags:
+        if skip:
+            skip = False
+        elif tok in TRAIN_ONLY_FLAGS:
+            skip = True
+        else:
+            out.append(tok)
+    return out
 
 
 def new_run_id():
@@ -121,7 +146,7 @@ def test_cmd(name, flags, a):
     cmd = [sys.executable, os.path.join(ROOT, "test.py"), "--test_hr_folder", hr,
            "--test_lr_folder", lr, "--checkpoint", checkpoint_path(name, a.epochs, a.run_id),
            "--upscale_factor", str(a.scale),
-           "--output_folder", results_dir(name, a.run_id)] + flags
+           "--output_folder", results_dir(name, a.run_id)] + model_flags(flags)
     cmd.append("--fast" if a.fast else "--no-fast")
     if name != "lowpass" and os.path.exists(os.path.join(exp_dir("lowpass", a.run_id), "test_x{}_summary.json".format(a.scale))):
         cmd += ["--ref_test_dir", exp_dir("lowpass", a.run_id)]  # dashed lowpass reference lines in the test plots
@@ -175,7 +200,7 @@ def format_dry_run(cfgs, a):
     return "\n".join(out)
 
 
-EPOCH_COLS = ["epoch", "lr", "train_loss_l1", "epoch_s", "val_psnr", "val_ssim"]
+EPOCH_COLS = ["epoch", "lr", "train_loss_l1", "epoch_s", "val_psnr", "val_ssim", "train_loss_freq"]
 
 
 def parse_train_log(text):
@@ -197,6 +222,10 @@ def parse_train_log(text):
         m = re.match(r"===> Epoch\[(\d+)\] avg Loss_l1: ([\d.]+)", line)
         if m:
             row(int(m.group(1))).update(epoch=int(m.group(1)), train_loss_l1=float(m.group(2)))
+            continue
+        m = re.match(r"===> Epoch\[(\d+)\] avg Loss_freq: ([\d.]+)", line)
+        if m:
+            row(int(m.group(1))).update(epoch=int(m.group(1)), train_loss_freq=float(m.group(2)))
             continue
         m = re.match(r"Epoch cost times: (\d+):(\d+):([\d.]+)", line)
         if m and cur is not None:
@@ -261,6 +290,9 @@ def main(argv=None):
     p.add_argument("--test_lr_folder", default=None)
     p.add_argument("--dwt_tweaks", default="norm,skipnorm",
                    help="comma-separated subset of {}: also run the dwt configs with these tweaks".format(",".join(TWEAKS)))
+    p.add_argument("--freq_lambdas", default="",
+                   help="comma-separated frequency-loss weights, e.g. 0.01,0.05,0.1: also run every config "
+                        "with L1 + lambda * FFT-L1 (named <config>_fl<lambda>)")
     p.add_argument("--only", default="lowpass,dwt_c3_gr1_skipnorm,dwt_c1_gr1_norm,dwt_cband_gr1_skipnorm",
                    help="comma-separated config names (default: the four 1000-epoch comparison configs; "
                         "--only '' runs every config)")
@@ -294,7 +326,13 @@ def main(argv=None):
     tweaks = tuple(t for t in a.dwt_tweaks.split(",") if t)
     if set(tweaks) - set(TWEAKS):
         p.error("--dwt_tweaks must be a comma-separated subset of {}".format(sorted(TWEAKS)))
-    cfgs = build_configs(PATCH_SIZES if a.patch_size == "both" else (int(a.patch_size),), tweaks)
+    try:
+        lambdas = tuple(dict.fromkeys(float(t) for t in a.freq_lambdas.split(",") if t.strip()))
+    except ValueError:
+        p.error("--freq_lambdas must be comma-separated numbers, got {!r}".format(a.freq_lambdas))
+    if any(l <= 0 for l in lambdas):
+        p.error("--freq_lambdas values must be > 0 (lambda 0 is the plain-L1 config, always run)")
+    cfgs = build_configs(PATCH_SIZES if a.patch_size == "both" else (int(a.patch_size),), tweaks, lambdas)
     if a.scale not in (2, 3, 4) or any(ps % a.scale for _, _, ps in cfgs):
         p.error("patch size must be divisible by --scale")
     if a.only:
@@ -302,7 +340,9 @@ def main(argv=None):
         unknown = set(want) - {n for n, _, _ in cfgs}
         if unknown:
             p.error("unknown config(s): {}; choose from {}".format(sorted(unknown), [n for n, _, _ in cfgs]))
-        cfgs = [c for c in cfgs if c[0] in want]
+        # A selected config also keeps its --freq_lambdas copies (<name>_fl<lambda>), so the
+        # default --only list still runs the loss sweep; an explicit `_fl` name works as well.
+        cfgs = [c for c in cfgs if c[0] in want or re.sub(r"_fl[\d.e+-]+$", "", c[0]) in want]
 
     a.run_id = a.run_id or new_run_id()
     if a.dry_run:
