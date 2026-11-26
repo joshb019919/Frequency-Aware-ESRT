@@ -38,26 +38,23 @@ parser.add_argument("--is_y", action='store_true', default=True,
 opt = parser.parse_args()
 
 print(opt)
-def forward_chop(model, x, shave=10, min_size=60000):
+def forward_chop(model, x, scale, shave=10, min_size=60000):
     """Memory-saving inference: split the LR image into 4 overlapping quadrants.
 
     Each quadrant (half size + `shave` px overlap) is super-resolved separately
     and stitched back together without the overlap. Quadrants of area
     >= `min_size` pixels are split recursively.
 
-    NOTE: the upscale factor is hard-coded to 4 below, so this is only correct
-    for x4 models; for x2/x3 it should use `opt.upscale_factor`.
-
     Args:
         model: SR network.
         x: LR input tensor (B, C, H, W).
+        scale: upscaling factor of the model (x2/x3/x4).
         shave: overlap (LR pixels) between quadrants.
         min_size: pixel-area threshold below which a quadrant is run directly.
 
     Returns:
-        SR tensor (B, C, 4*H, 4*W).
+        SR tensor (B, C, scale*H, scale*W).
     """
-    scale = 4  # hard-coded upscale factor (see NOTE above)
     n_GPUs = 1  # leftover from the multi-GPU EDSR/RCAN version
     b, c, h, w = x.size()
     h_half, w_half = h // 2, w // 2
@@ -77,7 +74,7 @@ def forward_chop(model, x, shave=10, min_size=60000):
             sr_list.extend(sr_batch.chunk(n_GPUs, dim=0))
     else:
         sr_list = [
-            forward_chop(model, patch, shave=shave, min_size=min_size) \
+            forward_chop(model, patch, scale, shave=shave, min_size=min_size) \
             for patch in lr_list
         ]
 
@@ -152,7 +149,7 @@ for imname in filelist:
 
     with torch.no_grad():
         start.record()
-        out = forward_chop(model, im_input) #model(im_input)
+        out = forward_chop(model, im_input, opt.upscale_factor) #model(im_input)
         end.record()
         torch.cuda.synchronize()
         time_list[i] = start.elapsed_time(end)  # milliseconds

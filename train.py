@@ -117,11 +117,8 @@ def forward_chop(model, x, scale, shave=10, min_size=60000):
             sr_batch = model(lr_batch)
             sr_list.extend(sr_batch.chunk(n_GPUs, dim=0))
     else:
-        # NOTE: `scale` is not forwarded to the recursive call, so it would hit
-        # a missing-argument TypeError if recursion were ever reached
-        # (it isn't for the small Set5 images used here).
         sr_list = [
-            forward_chop(model, patch, shave=shave, min_size=min_size) \
+            forward_chop(model, patch, scale, shave=shave, min_size=min_size) \
             for patch in lr_list
         ]
 

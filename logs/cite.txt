@@ -5,4 +5,49 @@
     url = "http://www.vision.ee.ethz.ch/~timofter/publications/Agustsson-CVPRW-2017.pdf",
     month = {July},
     year = {2017}
-} 
+}
+
+% Set5
+@InProceedings{Bevilacqua_2012_BMVC,
+    author = {Bevilacqua, Marco and Roumy, Aline and Guillemot, Christine and Alberi-Morel, Marie Line},
+    title = {Low-Complexity Single-Image Super-Resolution based on Nonnegative Neighbor Embedding},
+    booktitle = {Proceedings of the British Machine Vision Conference (BMVC)},
+    pages = {135.1--135.10},
+    publisher = {BMVA Press},
+    doi = {10.5244/C.26.135},
+    month = {September},
+    year = {2012}
+}
+
+% BSD100 (the 100-image test subset) and BSD300 (the 300-image set); both come from the Berkeley Segmentation Dataset
+@InProceedings{Martin_2001_ICCV,
+    author = {Martin, David and Fowlkes, Charless and Tal, Doron and Malik, Jitendra},
+    title = {A Database of Human Segmented Natural Images and its Application to Evaluating Segmentation Algorithms and Measuring Ecological Statistics},
+    booktitle = {Proceedings of the IEEE International Conference on Computer Vision (ICCV)},
+    volume = {2},
+    pages = {416--423},
+    month = {July},
+    year = {2001}
+}
+
+% Manga109
+@article{Matsui_2017_MTAP,
+    author = {Matsui, Yusuke and Ito, Kota and Aramaki, Yuji and Fujimoto, Azuma and Ogawa, Toru and Yamasaki, Toshihiko and Aizawa, Kiyoharu},
+    title = {Sketch-based Manga Retrieval using Manga109 Dataset},
+    journal = {Multimedia Tools and Applications},
+    volume = {76},
+    number = {20},
+    pages = {21811--21838},
+    publisher = {Springer},
+    year = {2017}
+}
+
+% Urban100
+@InProceedings{Huang_2015_CVPR,
+    author = {Huang, Jia-Bin and Singh, Abhishek and Ahuja, Narendra},
+    title = {Single Image Super-Resolution From Transformed Self-Exemplars},
+    booktitle = {The IEEE Conference on Computer Vision and Pattern Recognition (CVPR)},
+    pages = {5197--5206},
+    month = {June},
+    year = {2015}
+}
