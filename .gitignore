@@ -1,3 +1,9 @@
+# Tricky License Issues
+Test_Datasets/
+
+# Don't know why this wasn't already here
+baseline/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
