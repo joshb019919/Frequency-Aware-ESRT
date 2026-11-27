@@ -16,10 +16,14 @@ Examples:
   python experiments.py --root /data/data/div2k --only lowpass,dwt_c1_gr1 --dry_run
   python main.py --experiments --skip_download --data_dir /data/data/div2k -- --epochs 10
 
-Each config writes checkpoints to experiment/exp_<name>/ (existing checkpoint
-folders are never touched), logs to experiment/exp_<name>/{train,test}.log and SR
-images to results/exp_<name>/. A config whose final checkpoint already exists is
-not retrained unless --force is given.
+Every invocation gets a fresh run id (run_<YYYYMMDD_HHMMSS>), so nothing from earlier runs
+is overwritten: each config writes checkpoints and logs to
+experiment/<run id>/exp_<name>/{epoch_N.pth,train.log,test.log} and SR images to
+results/<run id>/exp_<name>/; the CSVs are experiment/experiments_<ts>.csv (+ _epochs). Old
+experiment/exp_<name>/ folders are never touched. --run_id <id> reuses an earlier run (to resume:
+a config whose final checkpoint already exists in it is not retrained unless --force); a reused
+config folder that holds files but no final checkpoint is refused unless --force, so partial
+results are never silently overwritten.
 """
 import argparse
 import csv
@@ -67,12 +71,31 @@ def build_configs(patch_sizes=(96,), tweaks=()):
     return cfgs
 
 
-def exp_dir(name):
-    return os.path.join("experiment", "exp_" + name)
+def new_run_id():
+    return "run_" + time.strftime("%Y%m%d_%H%M%S")
 
 
-def checkpoint_path(name, epochs):
-    return os.path.join(exp_dir(name), "epoch_{}.pth".format(epochs))
+def exp_dir(name, run_id=None):
+    """experiment/<run_id>/exp_<name>/ (run_id None = the legacy flat experiment/exp_<name>/)."""
+    return os.path.join("experiment", *([run_id] if run_id else []), "exp_" + name)
+
+
+def results_dir(name, run_id=None):
+    return os.path.join("results", *([run_id] if run_id else []), "exp_" + name)
+
+
+def checkpoint_path(name, epochs, run_id=None):
+    return os.path.join(exp_dir(name, run_id), "epoch_{}.pth".format(epochs))
+
+
+def unique_path(path):
+    """`path`, or path with _2, _3, ... before the extension if it already exists (never overwrite)."""
+    base, ext = os.path.splitext(path)
+    cand, i = path, 2
+    while os.path.exists(cand):
+        cand = "{}_{}{}".format(base, i, ext)
+        i += 1
+    return cand
 
 
 def train_cmd(name, flags, a, patch=96):
@@ -80,10 +103,14 @@ def train_cmd(name, flags, a, patch=96):
            "--scale", str(a.scale), "-nEpochs", str(a.epochs), "--batch_size", str(a.batch_size),
            "--patch_size", str(patch), "--threads", str(a.threads),
            "--seed", str(a.seed), "--val_every", str(a.val_every),
-           "--save_dir", exp_dir(name)] + flags
+           "--save_dir", exp_dir(name, a.run_id)] + flags
     cmd.append("--fast" if a.fast else "--no-fast")
     if a.no_amp:
         cmd.append("--no_amp")
+    if name != "lowpass":  # compare against the lowpass baseline of the same run when it has finished
+        ref = os.path.join(exp_dir("lowpass", a.run_id), "history.json")
+        if os.path.exists(ref):
+            cmd += ["--ref_history", ref]
     return cmd
 
 
@@ -91,10 +118,12 @@ def test_cmd(name, flags, a):
     hr = a.test_hr_folder
     lr = a.test_lr_folder or "Test_Datasets/Set5_LR/x{}/".format(a.scale)
     cmd = [sys.executable, os.path.join(ROOT, "test.py"), "--test_hr_folder", hr,
-           "--test_lr_folder", lr, "--checkpoint", checkpoint_path(name, a.epochs),
+           "--test_lr_folder", lr, "--checkpoint", checkpoint_path(name, a.epochs, a.run_id),
            "--upscale_factor", str(a.scale),
-           "--output_folder", os.path.join("results", "exp_" + name)] + flags
+           "--output_folder", results_dir(name, a.run_id)] + flags
     cmd.append("--fast" if a.fast else "--no-fast")
+    if name != "lowpass" and os.path.exists(os.path.join(exp_dir("lowpass", a.run_id), "test_x{}_summary.json".format(a.scale))):
+        cmd += ["--ref_test_dir", exp_dir("lowpass", a.run_id)]  # dashed lowpass reference lines in the test plots
     return cmd
 
 
@@ -235,9 +264,12 @@ def main(argv=None):
     p.add_argument("--fast", action=argparse.BooleanOptionalAction, default=True,
                    help="torch.compile + bf16 + TF32 in train/test (default on; --no-fast disables)")
     p.add_argument("--no_amp", action="store_true", help="plain fp32 training")
-    p.add_argument("--force", action="store_true", help="retrain even if the final checkpoint exists")
+    p.add_argument("--force", action="store_true",
+                   help="retrain even if the final checkpoint exists, and allow writing into a non-empty config folder of a reused --run_id")
+    p.add_argument("--run_id", default=None,
+                   help="reuse an earlier run folder (experiment/<run_id>/); default: a new run_<timestamp> so nothing is overwritten")
     p.add_argument("--from_logs", action="store_true",
-                   help="no training: rebuild a per-epoch CSV from existing experiment/exp_*/train.log files")
+                   help="no training: rebuild a per-epoch CSV from existing experiment/exp_*/train.log and experiment/run_*/exp_*/train.log files")
     p.add_argument("--dry_run", "--dry-run", action="store_true", help="print the commands and exit")
     a = p.parse_args(argv)
 
@@ -246,9 +278,12 @@ def main(argv=None):
     if a.from_logs:
         import glob
         out = os.path.join(ROOT, "experiment", "epochs_{}.csv".format(time.strftime("%Y%m%d_%H%M%S")))
-        logs = sorted(glob.glob(os.path.join(ROOT, "experiment", "exp_*", "train.log")))
+        logs = sorted(glob.glob(os.path.join(ROOT, "experiment", "exp_*", "train.log")) +
+                      glob.glob(os.path.join(ROOT, "experiment", "run_*", "exp_*", "train.log")))
         for lp in logs:
-            write_epoch_csv(out, os.path.basename(os.path.dirname(lp))[len("exp_"):], parse_train_log(open(lp).read()))
+            d = os.path.dirname(lp)
+            name, parent = os.path.basename(d)[len("exp_"):], os.path.basename(os.path.dirname(d))
+            write_epoch_csv(out, name + "@" + parent if parent.startswith("run_") else name, parse_train_log(open(lp).read()))
         print("{} log(s) -> {}".format(len(logs), out if logs else "nothing written"))
         return 0
 
@@ -265,28 +300,42 @@ def main(argv=None):
             p.error("unknown config(s): {}; choose from {}".format(sorted(unknown), [n for n, _, _ in cfgs]))
         cfgs = [c for c in cfgs if c[0] in want]
 
+    a.run_id = a.run_id or new_run_id()
     if a.dry_run:
+        print("Run id: {} (a real run assigns its own timestamp unless --run_id is given)".format(a.run_id))
         print(format_dry_run(cfgs, a))
         return 0
 
-    out_csv = os.path.join(ROOT, "experiment", "experiments_{}.csv".format(time.strftime("%Y%m%d_%H%M%S")))
+    # Fail fast, before any long training: never write into a reused config folder that holds
+    # files but no final checkpoint (an interrupted run), unless --force.
+    if not a.force:
+        busy = [n for n, _, _ in cfgs
+                if os.path.isdir(os.path.join(ROOT, exp_dir(n, a.run_id))) and os.listdir(os.path.join(ROOT, exp_dir(n, a.run_id)))
+                and not os.path.exists(os.path.join(ROOT, checkpoint_path(n, a.epochs, a.run_id)))]
+        if busy:
+            p.error("{} already holds files from an unfinished run for: {}; use a new run (omit --run_id) or --force"
+                    .format(os.path.join("experiment", a.run_id), ", ".join(busy)))
+
+    stamp = a.run_id[len("run_"):] if a.run_id.startswith("run_") else a.run_id
+    out_csv = unique_path(os.path.join(ROOT, "experiment", "experiments_{}.csv".format(stamp)))
     os.makedirs(os.path.dirname(out_csv), exist_ok=True)
     out_epochs_csv = out_csv.replace(".csv", "_epochs.csv")
+    print("run id: {}  (experiment/{}/, results/{}/)".format(a.run_id, a.run_id, a.run_id), flush=True)
     cols = ["name", "patch_size", "epochs", "rc_train", "rc_test", "params", "train_s", "set5_psnr", "set5_ssim",
             "test_ms_per_img", "checkpoint"]
     rows = []
     for name, flags, patch in cfgs:
-        ckpt = checkpoint_path(name, a.epochs)
+        ckpt = checkpoint_path(name, a.epochs, a.run_id)
         params, train_s, rc_train = None, None, 0
         if os.path.exists(os.path.join(ROOT, ckpt)) and not a.force:
             print("[{}] final checkpoint exists, skipping training (use --force to retrain)".format(name))
         else:
             print("[{}] training {} epochs ...".format(name, a.epochs), flush=True)
             rc_train, text, train_s = run_logged(train_cmd(name, flags, a, patch),
-                                                 os.path.join(ROOT, exp_dir(name), "train.log"),
+                                                 os.path.join(ROOT, exp_dir(name, a.run_id), "train.log"),
                                                  "[{}] ".format(name))
             params = parse_params(text)
-        log_path = os.path.join(ROOT, exp_dir(name), "train.log")
+        log_path = os.path.join(ROOT, exp_dir(name, a.run_id), "train.log")
         if os.path.exists(log_path):
             ep_rows = parse_train_log(open(log_path).read())
             write_epoch_csv(out_epochs_csv, name, ep_rows)
@@ -295,7 +344,7 @@ def main(argv=None):
         if rc_train == 0 and os.path.exists(os.path.join(ROOT, ckpt)):
             print("[{}] testing ...".format(name), flush=True)
             rc_test, text, _ = run_logged(test_cmd(name, flags, a),
-                                          os.path.join(ROOT, exp_dir(name), "test.log"))
+                                          os.path.join(ROOT, exp_dir(name, a.run_id), "test.log"))
             psnr, ssim, ms = parse_test_output(text)
         rows.append(dict(name=name, patch_size=patch, epochs=a.epochs, rc_train=rc_train, rc_test=rc_test, params=params,
                          train_s=None if train_s is None else round(train_s, 1), set5_psnr=psnr,

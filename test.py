@@ -12,6 +12,7 @@ Usually launched through main.py:  python main.py --test ...
 """
 import argparse
 import torch
+import json
 import os
 import numpy as np
 import utils
@@ -19,6 +20,7 @@ import skimage.color as sc
 import cv2
 from model import  esrt
 from data import benchmarks
+import metrics_freq
 import plotting
 
 # Testing settings
@@ -38,6 +40,9 @@ parser.add_argument("--plot", action=argparse.BooleanOptionalAction, default=Tru
                     help='save a test summary plot (per-set mean PSNR/SSIM bars + per-image PSNR)')
 parser.add_argument("--plot_path", type=str, default=None,
                     help='summary plot path (default <checkpoint dir>/test_x<scale>.png)')
+parser.add_argument("--ref_test_dir", type=str, default=None,
+                    help='folder with a reference run\'s test_x<scale>_summary.json / _freq.csv (e.g. lowpass); drawn as dashed black lines in the plots')
+metrics_freq.add_args(parser)  # --hf_metrics / --perceptual / --wavelets
 utils.add_fast_arg(parser)
 esrt.add_model_args(parser)  # must match the flags the checkpoint was trained with
 parser.add_argument("--checkpoint", type=str, default='checkpoints/IMDN_x2.pth',
@@ -134,8 +139,8 @@ def build_model():
     return model
 
 
-def run_set(model, hr_folder, lr_folder, out_folder):
-    """Super-resolve every image of one set; returns (per-image psnr, ssim, ms) arrays."""
+def run_set(model, hr_folder, lr_folder, out_folder, freq_eval=None):
+    """Super-resolve every image of one set; returns (per-image psnr, ssim, ms arrays, freq-metric rows)."""
     # Benchmarks ship as .png or .bmp (e.g. original Set5/Set14 are .bmp); detect which
     # one the HR and LR folders actually contain instead of guessing from the folder name.
     ext = utils.detect_image_ext(hr_folder)
@@ -149,6 +154,7 @@ def run_set(model, hr_folder, lr_folder, out_folder):
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     os.makedirs(out_folder, exist_ok=True)
+    freq_rows = []
 
     for i, imname in enumerate(filelist):
         stem = os.path.splitext(os.path.basename(imname))[0]
@@ -187,13 +193,21 @@ def run_set(model, hr_folder, lr_folder, out_folder):
             im_pre = cropped_sr_img
         psnr_list[i] = utils.compute_psnr(im_pre, im_label)
         ssim_list[i] = utils.compute_ssim(im_pre, im_label)
+        if freq_eval is not None:
+            freq_rows.append(dict(image=stem, **freq_eval(cropped_sr_img, cropped_gt_img)))
 
         # Save the SR image (RGB -> BGR for cv2) as <name>x<scale>.png.
         cv2.imwrite(os.path.join(out_folder, stem + 'x' + str(opt.upscale_factor) + '.png'), out_img[:, :, [2, 1, 0]])
-    return psnr_list, ssim_list, time_list
+    return psnr_list, ssim_list, time_list, freq_rows
 
 
 model = build_model()
+freq_eval = None
+if opt.hf_metrics:
+    try:
+        freq_eval = metrics_freq.FreqEvaluator.from_args(opt, device if cuda else 'cpu')
+    except ValueError as e:
+        parser.error(str(e))
 
 if bool(opt.test_hr_folder) != bool(opt.test_lr_folder):
     parser.error("--test_hr_folder and --test_lr_folder must be given together")
@@ -214,15 +228,36 @@ else:
         parser.error(str(e))
 
 summary = {}
+freq_results = {}
 for name, hr, lr, out in jobs:
-    psnr_list, ssim_list, time_list = run_set(model, hr, lr, out)
+    psnr_list, ssim_list, time_list, freq_rows = run_set(model, hr, lr, out, freq_eval)
     summary[name] = {"psnr": psnr_list.tolist(), "ssim": ssim_list.tolist()}
     if len(jobs) > 1:
         print("===> Test set {} ({} images)".format(name, len(psnr_list)))
+    if freq_rows:
+        freq_results[name] = freq_rows
+        print("===> Freq[{}] {}".format(name, metrics_freq.summary_line(metrics_freq.mean_metrics(freq_rows), freq_eval.wavelets)))
     print("Mean PSNR: {}, SSIM: {}, TIME: {} ms".format(np.mean(psnr_list), np.mean(ssim_list), np.mean(time_list)))
+
+_base = os.path.splitext(opt.plot_path or os.path.join(os.path.dirname(os.path.abspath(opt.checkpoint)),
+                                                       'test_x{}.png'.format(opt.upscale_factor)))[0]
+os.makedirs(os.path.dirname(_base), exist_ok=True)
+with open(_base + '_summary.json', 'w') as _f:  # per-image PSNR/SSIM, used as --ref_test_dir by later runs
+    json.dump(summary, _f)
+_ref = None
+if opt.ref_test_dir and os.path.abspath(opt.ref_test_dir) != os.path.dirname(os.path.abspath(_base)):
+    _ref = plotting.load_test_reference(opt.ref_test_dir, opt.upscale_factor)
+
+if freq_results:
+    _base = os.path.splitext(opt.plot_path or os.path.join(os.path.dirname(os.path.abspath(opt.checkpoint)),
+                                                           'test_x{}.png'.format(opt.upscale_factor)))[0]
+    metrics_freq.write_csv(_base + '_freq.csv', freq_results)
+    print("Frequency metrics CSV saved to {}_freq.csv".format(_base))
+    if opt.plot and plotting.plot_test_freq(_base + '_freq.png', freq_results, reference=_ref):
+        print("Frequency metrics plot saved to {}_freq.png".format(_base))
 
 if opt.plot:
     plot_path = opt.plot_path or os.path.join(os.path.dirname(os.path.abspath(opt.checkpoint)),
                                               'test_x{}.png'.format(opt.upscale_factor))
-    if plotting.plot_test_summary(plot_path, summary, title=os.path.basename(os.path.dirname(os.path.abspath(opt.checkpoint)))):
+    if plotting.plot_test_summary(plot_path, summary, title=os.path.basename(os.path.dirname(os.path.abspath(opt.checkpoint))), reference=_ref):
         print("Test summary plot saved to {}".format(plot_path))

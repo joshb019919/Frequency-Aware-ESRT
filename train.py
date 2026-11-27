@@ -19,6 +19,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from model import esrt
 from data import DIV2K, benchmarks
+import metrics_freq
 import plotting
 import utils
 import skimage.color as sc
@@ -60,6 +61,8 @@ esrt.add_model_args(parser)  # --freq / --conv / --global_res
 parser.add_argument("--amp", action="store_true", default=True, help="deprecated no-op: bf16 AMP is on by default (CUDA)")
 parser.add_argument("--no_amp", action="store_true", default=False, help="disable bf16 AMP and channels_last (plain fp32 training)")
 parser.add_argument("--val_every", type=int, default=5, help="validate every N epochs (and once after the last epoch)")
+parser.add_argument("--ref_history", type=str, default=None,
+                    help="history.json of a finished run (e.g. lowpass); its final level is drawn as a dashed black line in the curves")
 parser.add_argument("--save_dir", type=str, default=None, help="checkpoint folder (default experiment/checkpoint_ESRT_x<scale>[variant]/)")
 parser.add_argument("--val_sets", type=str, default=benchmarks.DEFAULT_VAL_SETS,
                     help="comma-separated validation sets, from: " + ",".join(benchmarks.NAMES))
@@ -67,6 +70,7 @@ parser.add_argument("--bench_root", type=str, default=benchmarks.DEFAULT_BENCH_R
                     help="directory holding the benchmark datasets (set14, bsds300, ...)")
 parser.add_argument("--plot", action=argparse.BooleanOptionalAction, default=True,
                     help="write <save_dir>/curves.png (train loss | val PSNR | val SSIM), updated at each validation")
+metrics_freq.add_args(parser)  # --hf_metrics / --perceptual / --wavelets
 utils.add_fast_arg(parser)
 
 def train(epoch, model, optimizer, l1_criterion, training_data_loader, args, device):
@@ -163,11 +167,12 @@ def forward_chop(model, x, scale, shave=10, min_size=60000):
 
     return output
 
-def evaluate(scale, model, loader, args, device):
+def evaluate(scale, model, loader, args, device, freq_eval=None, freq_rows=None):
     """Mean (PSNR, SSIM) of `model` over one validation loader.
 
     Images are super-resolved with forward_chop, shaved by `scale` border
-    pixels, and (if --isY) compared on the quantised Y channel of YCbCr.
+    pixels, and (if --isY) compared on the quantised Y channel of YCbCr. If `freq_eval` (a
+    metrics_freq.FreqEvaluator) is given, its per-image metric dicts are appended to `freq_rows`.
     """
     model.eval()
     avg_psnr, avg_ssim = 0, 0
@@ -193,21 +198,31 @@ def evaluate(scale, model, loader, args, device):
             im_pre = cropped_sr_img
         avg_psnr += utils.compute_psnr(im_pre, im_label)
         avg_ssim += utils.compute_ssim(im_pre, im_label)
+        if freq_eval is not None and freq_rows is not None:
+            freq_rows.append(freq_eval(cropped_sr_img, cropped_gt_img))
     return avg_psnr / len(loader), avg_ssim / len(loader)
 
 
-def valid(scale, model, loaders, args, device, epochs_trained=0):
+def valid(scale, model, loaders, args, device, epochs_trained=0, freq_eval=None, extras=None):
     """Validate on one DataLoader or a {name: DataLoader} dict; print and return the scores.
 
     With several sets, prints one '===> Valid[name] ...' line per set, then the
     '===> Valid. psnr/ssim' line (the one experiments.py parses) holding the mean over the sets.
-    Returns {name: (psnr, ssim)}.
+    Returns {name: (psnr, ssim)}. With `freq_eval`, also prints a '===> Freq[name]' line per set and,
+    if `extras` is a dict, fills it with {name: mean frequency metrics}.
     """
     if not isinstance(loaders, dict):
         loaders = {"val": loaders}
     results = {}
     for name, loader in loaders.items():
-        results[name] = evaluate(scale, model, loader, args, device)
+        rows = [] if freq_eval is not None else None
+        results[name] = evaluate(scale, model, loader, args, device, freq_eval, rows)
+        if rows:
+            mean = metrics_freq.mean_metrics(rows)
+            print("===> Freq[{}] {} (weights after {} epochs)".format(
+                name, metrics_freq.summary_line(mean, freq_eval.wavelets), epochs_trained))
+            if extras is not None:
+                extras[name] = mean
         if len(loaders) > 1:
             print("===> Valid[{}] psnr: {:.4f}, ssim: {:.4f} (weights after {} epochs)".format(
                 name, results[name][0], results[name][1], epochs_trained))
@@ -272,6 +287,13 @@ def main():
         parser.error(str(e))
     training_data_loader = DataLoader(dataset=trainset, num_workers=args.threads, batch_size=args.batch_size, shuffle=True, pin_memory=True, drop_last=True,
                                      persistent_workers=args.threads > 0)
+
+    freq_eval = None
+    if args.hf_metrics:
+        try:
+            freq_eval = metrics_freq.FreqEvaluator.from_args(args, device if cuda else "cpu")
+        except ValueError as e:
+            parser.error(str(e))
 
     print("===> Building models")
     args.is_train = True
@@ -339,16 +361,19 @@ def main():
     code_start = datetime.datetime.now()
     timer = utils.Timer()
     save_dir = (args.save_dir or "experiment/checkpoint_ESRT_x{}{}/".format(args.scale, esrt.variant_tag(args))).rstrip("/")
-    plotter = plotting.TrainValPlotter(save_dir, title=os.path.basename(save_dir)) if args.plot else None
+    plotter = plotting.TrainValPlotter(save_dir, title=os.path.basename(save_dir),
+                                       reference=plotting.load_reference(args.ref_history) if args.ref_history else None) if args.plot else None
     # Main loop. Note validation runs *before* training each epoch, so the reported
     # score lags the weights saved at the end of that epoch by one epoch.
     for epoch in range(args.start_epoch, args.nEpochs + 1):
         t_epoch_start = timer.t()
         epoch_start = datetime.datetime.now()
         if (epoch - args.start_epoch) % args.val_every == 0:
-            res = valid(args.scale, model, val_loaders, args, device, epoch - 1)
+            extras = {}
+            res = valid(args.scale, model, val_loaders, args, device, epoch - 1, freq_eval, extras)
             if plotter:
                 plotter.add_val(epoch - 1, res)
+                plotter.add_freq(epoch - 1, extras)
                 plotter.save()
         loss = train(epoch, train_model, optimizer, l1_criterion, training_data_loader, args, device)
         if plotter:
@@ -364,9 +389,11 @@ def main():
         t_epoch = utils.time_text(t - t_epoch_start)
         t_elapsed, t_all = utils.time_text(t), utils.time_text(t / prog)
         print('{} {}/{}'.format(t_epoch, t_elapsed, t_all))
-    res = valid(args.scale, model, val_loaders, args, device, args.nEpochs)  # score the final weights
+    extras = {}
+    res = valid(args.scale, model, val_loaders, args, device, args.nEpochs, freq_eval, extras)  # score the final weights
     if plotter:
         plotter.add_val(args.nEpochs, res)
+        plotter.add_freq(args.nEpochs, extras)
         plotter.save()
         print("===> Training curves saved to {}/curves.png".format(save_dir))
     code_end = datetime.datetime.now()

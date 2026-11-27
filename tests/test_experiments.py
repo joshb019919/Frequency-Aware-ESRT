@@ -29,7 +29,7 @@ def test_patch_size_dimension():
 def test_commands_use_separate_checkpoint_dirs_and_same_settings():
     class A:  # minimal args
         root = "/d"; scale = 2; epochs = 10; batch_size = 16; patch_size = 0; threads = 8; seed = 1
-        val_every = 5; fast = False; no_amp = False; test_hr_folder = "Test_Datasets/Set5/"; test_lr_folder = None
+        val_every = 5; fast = False; no_amp = False; run_id = None; test_hr_folder = "Test_Datasets/Set5/"; test_lr_folder = None
     a = A()
     c = experiments.train_cmd("lowpass", [], a, 96)
     assert c[c.index("--save_dir") + 1] == os.path.join("experiment", "exp_lowpass")

@@ -77,12 +77,25 @@ def test_prepare_benchmarks_write_pair_sizes_and_idempotent(tmp_path):
     assert prep.write_pair(src, "im", str(tmp_path), (2, 3, 4), False) == 0  # never rewrites existing files
 
 
-def test_manga109_items_picks_middle_page(tmp_path):
+def test_manga109_middle_items_picks_middle_page(tmp_path):
     for book, pages in (("A", 5), ("B", 4)):
         for p in range(pages):
             _img(str(tmp_path / "images" / book / "{:03d}.jpg".format(p)), (8, 8))
-    items = dict(prep.manga109_items(str(tmp_path)))
+    items = {n: path for n, path, box in prep.manga109_middle_items(str(tmp_path))}
     assert set(items) == {"A_002", "B_002"}
+
+
+def test_manga109_official_mapping_and_crops(tmp_path):
+    m = json.load(open(os.path.join(ROOT, "scripts", "manga109_official.json")))
+    assert len(m) == 109 and all(e["page"] == "000.jpg" and e["side"] in "LR" for e in m.values())
+    assert "ARMS" in m and "ThatsIzumiko_000" in m  # names follow the upstream outputs
+    assert [k for k, e in m.items() if e["side"] == "L"] == ["LoveHina_vol01"]
+    items = {n: (path, box) for n, path, box in prep.manga109_official_items(str(tmp_path))}
+    assert len(items) == 109
+    assert items["ARMS"][1] == (827, 0, 827 + 826, 1170) and items["LoveHina_vol01"][1] == (0, 0, 826, 1170)
+    assert items["ARMS"][0].endswith("images/ARMS/000.jpg")
+    for _, box in items.values():
+        assert box[2] - box[0] == 826 and box[3] - box[1] == 1170  # official size, 1654-wide spreads
 
 
 def test_train_val_plotter_writes_files(tmp_path):
@@ -166,3 +179,21 @@ def test_train_epoch_returns_finite_loss_and_all_grads(capsys):
     loss = train.train(1, model, opt, nn.L1Loss(), ld, args, torch.device("cpu"))
     assert isinstance(loss, float) and np.isfinite(loss) and loss > 0
     assert all(p.grad is not None and torch.isfinite(p.grad).all() and p.grad.shape == p.shape for p in model.parameters())
+
+
+def test_reference_lines_drawn(tmp_path):
+    """load_reference averages the last points; curves/freq_curves still render with a reference."""
+    import json
+    import plotting
+    hist = {"loss": {"1": 0.02, "2": 0.01}, "val": {"set5": {"0": [10, 0.1], "5": [30, 0.9]}},
+            "freq": {"set5": {"5": {"hfen": 0.2, "sbrel_haar_HH": 0.9, "sb_haar_HH": 30.0}}}}
+    (tmp_path / "h.json").write_text(json.dumps(hist))
+    ref = plotting.load_reference(str(tmp_path / "h.json"), last_n=2)
+    assert ref["val"]["set5"] == (20.0, 0.5) and abs(ref["loss"] - 0.015) < 1e-9
+    pl = plotting.TrainValPlotter(str(tmp_path / "out"), reference=ref)
+    pl.add_loss(1, 0.03)
+    pl.add_val(5, {"set5": (31.0, 0.91)})
+    pl.add_freq(5, {"set5": {"hfen": 0.1, "sbrel_haar_HH": 0.8, "sb_haar_HH": 31.0}})
+    pl.save()
+    assert (tmp_path / "out" / "curves.png").exists() and (tmp_path / "out" / "freq_curves.png").exists()
+    assert plotting.load_reference(str(tmp_path / "missing.json")) is None
