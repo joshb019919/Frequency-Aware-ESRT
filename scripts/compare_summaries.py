@@ -20,7 +20,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("reference")
     p.add_argument("candidate")
-    p.add_argument("--tol", type=float, default=0.005, help="max allowed per-image PSNR difference in dB")
+    p.add_argument("--tol", type=float, default=0.01, help="max allowed per-image PSNR difference in dB (bf16 runs differ by up to ~0.007 dB across GPUs)")
     p.add_argument("--label", default="")
     a = p.parse_args()
     ref, new = load(a.reference), load(a.candidate)
