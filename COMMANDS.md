@@ -109,12 +109,12 @@ Trains and tests every config, with the same seed and settings. New run folder `
 | Flag | Default | Meaning |
 |---|---|---|
 | `--root` | none | Dataset directory (required unless `--from_logs`). |
-| `--epochs` | 10 | Epochs per config. |
+| `--epochs` | 1000 | Epochs per config. |
 | `--scale`, `--batch_size`, `--threads`, `--seed`, `--val_every` | 2, 16, 8, 1, 5 | Forwarded to train.py. |
 | `--patch_size` | 96 | `96`, `144` or `both`. |
-| `--only` | all | Comma-separated config names, e.g. `lowpass,dwt_c3_gr1_skipnorm`. |
-| `--dwt_tweaks` | none | Subset of `skip,norm,skipnorm`: also run the DWT configs with those tweaks (named `<config>_<tweak>`). |
-| `--fast` / `--no-fast`, `--no_amp` | on, off | Speed options for training and testing. |
+| `--only` | `lowpass,dwt_c3_gr1_skipnorm,dwt_c1_gr1_norm,dwt_cband_gr1_skipnorm` | Comma-separated config names. `--only ''` runs every config. |
+| `--dwt_tweaks` | `norm,skipnorm` | Subset of `skip,norm,skipnorm`: also run the DWT configs with those tweaks (named `<config>_<tweak>`). `--dwt_tweaks ''` for none. |
+| `--fast` / `--no-fast`, `--amp` / `--no_amp` | on, on (bf16) | Speed options for training and testing. `--amp` is accepted for clarity; `--no_amp` gives plain fp32. |
 | `--run_id` | new each run | Reuse a run folder; configs with a final checkpoint are skipped (resume). |
 | `--force` | off | Retrain even if the final checkpoint exists; allow a non-empty config folder. |
 | `--from_logs` | off | No training: rebuild a per-epoch CSV from existing `train.log` files. |
@@ -122,13 +122,21 @@ Trains and tests every config, with the same seed and settings. New run folder `
 | `--test_hr_folder` / `--test_lr_folder` | `Test_Datasets/Set5/` / `.../Set5_LR/x<scale>/` | Test folders. |
 
 ```bash
-# preview
-python experiments.py --root /data/data/div2k --epochs 1000 --only lowpass,dwt_c3_gr1_skipnorm --dry_run
+# default: the four 1000-epoch comparison configs, x2, patch 96, --fast, bf16 AMP
+python experiments.py --root /data/data/div2k
+# ...which is the same as
+python experiments.py --root /data/data/div2k --dwt_tweaks norm,skipnorm \
+    --only lowpass,dwt_c3_gr1_skipnorm,dwt_c1_gr1_norm,dwt_cband_gr1_skipnorm \
+    --epochs 1000 --scale 2 --patch_size 96 --fast --amp
 
-# the 1000-epoch comparison (fp32, no compile)
-python experiments.py --root /data/data/div2k --scale 2 --patch_size 96 --epochs 1000 \
-    --dwt_tweaks norm,skipnorm --only lowpass,dwt_c3_gr1_skipnorm,dwt_cband_gr1_skipnorm,dwt_c1_gr1_norm \
-    --no-fast --no_amp
+# preview without training
+python experiments.py --root /data/data/div2k --dry_run
+
+# the same comparison in plain fp32, no compile
+python experiments.py --root /data/data/div2k --no-fast --no_amp
+
+# every base config, 10 epochs, quick smoke run
+python experiments.py --root /data/data/div2k --epochs 10 --only '' --dwt_tweaks ''
 
 # resume an interrupted run
 python experiments.py --root /data/data/div2k --epochs 1000 --run_id run_20261125_122259
@@ -144,7 +152,7 @@ python main.py --train --skip_download --data_dir /data/data/div2k -- -nEpochs 1
 python main.py --test --skip_download --data_dir /data/data/div2k --checkpoint experiments/lowpass/epoch_1000.pth --scale 2
 
 # experiments
-python main.py --experiments --skip_download --data_dir /data/data/div2k -- --epochs 10
+python main.py --experiments --skip_download --data_dir /data/data/div2k   # experiments.py defaults apply
 ```
 
 | Flag | Meaning |

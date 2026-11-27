@@ -12,7 +12,8 @@ Configs (7 per patch size): lowpass; dwt with --conv {1,3,band} x --global_res {
 config at 96 and at 144. Names at 144 get a `_p144` suffix (96 keeps the plain name).
 
 Examples:
-  python experiments.py --root /data/data/div2k --epochs 10
+  python experiments.py --root /data/data/div2k          # defaults: the 4 comparison configs, 1000 epochs
+  python experiments.py --root /data/data/div2k --epochs 10 --only '' --dwt_tweaks ''   # every base config, quick
   python experiments.py --root /data/data/div2k --only lowpass,dwt_c1_gr1 --dry_run
   python main.py --experiments --skip_download --data_dir /data/data/div2k -- --epochs 10
 
@@ -248,7 +249,7 @@ def run_logged(cmd, log_path, echo_prefix=""):
 def main(argv=None):
     p = argparse.ArgumentParser(description="Run all ESRT variant experiments")
     p.add_argument("--root", default=None, help="dataset directory (train.py --root); required unless --from_logs")
-    p.add_argument("--epochs", type=int, default=10)
+    p.add_argument("--epochs", type=int, default=1000)
     p.add_argument("--scale", type=int, default=2)
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--patch_size", choices=["96", "144", "both"], default="96",
@@ -258,11 +259,14 @@ def main(argv=None):
     p.add_argument("--val_every", type=int, default=5)
     p.add_argument("--test_hr_folder", default="Test_Datasets/Set5/")
     p.add_argument("--test_lr_folder", default=None)
-    p.add_argument("--dwt_tweaks", default="",
+    p.add_argument("--dwt_tweaks", default="norm,skipnorm",
                    help="comma-separated subset of {}: also run the dwt configs with these tweaks".format(",".join(TWEAKS)))
-    p.add_argument("--only", default=None, help="comma-separated config names")
+    p.add_argument("--only", default="lowpass,dwt_c3_gr1_skipnorm,dwt_c1_gr1_norm,dwt_cband_gr1_skipnorm",
+                   help="comma-separated config names (default: the four 1000-epoch comparison configs; "
+                        "--only '' runs every config)")
     p.add_argument("--fast", action=argparse.BooleanOptionalAction, default=True,
                    help="torch.compile + bf16 + TF32 in train/test (default on; --no-fast disables)")
+    p.add_argument("--amp", action="store_true", help="bf16 AMP training (already the default; accepted for clarity)")
     p.add_argument("--no_amp", action="store_true", help="plain fp32 training")
     p.add_argument("--force", action="store_true",
                    help="retrain even if the final checkpoint exists, and allow writing into a non-empty config folder of a reused --run_id")
