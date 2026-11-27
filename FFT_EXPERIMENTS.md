@@ -20,31 +20,35 @@ Configs train **one per GPU in parallel**. GPUs are detected automatically, so t
 ```bash
 git clone -b dev/fft https://github.com/joshb019919/Frequency-Aware-ESRT.git
 cd Frequency-Aware-ESRT
-python3 -m venv .venv
-.venv/bin/pip install --upgrade pip
-.venv/bin/pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124   # match `nvidia-smi` CUDA version
-.venv/bin/pip install -r requirements.txt
+python3 -m venv --without-pip .venv          # works even without the python3-venv system package
+source .venv/bin/activate
+curl -sS https://bootstrap.pypa.io/get-pip.py | python
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124   # match `nvidia-smi` CUDA version
+pip install -r requirements.txt
+python -c "import torch; print(torch.cuda.is_available(), torch.cuda.device_count())"   # e.g. True 2
 ```
 
-All the scripts below use `.venv/bin/python` automatically. Set `PY=/path/to/python` to override.
+Run `source .venv/bin/activate` in every new terminal or tmux window. The scripts also use `.venv/bin/python` on their own; set `PY=/path/to/python` to override.
 
 ## 2. Download the data (first time only, re-runnable)
 
+Run every command from the `Frequency-Aware-ESRT` folder. All data goes into folders **inside the repo**, so no special permissions are needed. Those folders are already in the clone (empty, with a `.gitkeep`) and git-ignored, so the data is never committed. You need about 20 GB free.
+
 ```bash
-DATA=/data/data scripts/download_data.sh
+scripts/download_data.sh
 ```
 
-| Set | Source | Goes to |
+| Set | Source | Repo folder |
 |---|---|---|
-| DIV2K train ×2 (~4.4 GB, converted to `.npy`) | ETH Zurich | `$DATA/div2k/DF2K_decoded/` |
-| Set5 | `linzino7/Set5-dataset` (same as the DWT runs) | `Test_Datasets/` in the repo (git-ignored) |
-| Set14 | Jia-Bin Huang's SelfExSR (named in the proposal) | `$DATA/set14/` |
-| BSDS300 test split | Berkeley | `$DATA/bsds300/` |
-| Manga109 | **manual**: licence from manga109.org, unpacked to `$DATA/manga109/images/`, plus `scripts/manga109_official.json` from Josh | `$DATA/manga109/` |
+| DIV2K train ×2 (~4.4 GB, converted to `.npy`) | ETH Zurich | `div2k/DF2K_decoded/` |
+| Set5 | `linzino7/Set5-dataset` (same as the DWT runs) | `Test_Datasets/Set5`, `Test_Datasets/Set5_LR/x2` |
+| Set14 | Jia-Bin Huang's SelfExSR (named in the proposal) | `set14/Set14_HR`, `set14/Set14_LR_x2` |
+| BSDS300 test split | Berkeley | `bsds300/HR`, `bsds300/LR/x2` |
+| Manga109 | **manual**: licence from manga109.org, unpack to `manga109/images/`, plus `scripts/manga109_official.json` from Josh; then re-run the script | `manga109/HR`, `manga109/LR/x2` |
 
-The script ends by running `scripts/check_setup.py`, which must report "all required checks passed". Manga109 is the one optional set: without it, the Manga109 column shows `-` and everything else still runs.
+These are the paths `train.py`, `test.py` and `experiments.py` already look for (relative to the repo), so no path flags are needed anywhere. The script ends with `scripts/check_setup.py`; everything except Manga109 should be `ok`. Without Manga109, the Manga109 column shows `-` and the rest still runs.
 
-If `$DATA` is not `/data/data`, pass `ROOT=$DATA/div2k BENCH=$DATA` to the run commands below.
+If the data already lives somewhere else, `ROOT=/path/div2k BENCH=/path scripts/run_fft_experiments.sh ...` links those benchmark folders into the repo, where training validation needs them.
 
 ## 3. Run
 
@@ -52,6 +56,7 @@ Use `tmux`, because the training phases run for hours:
 
 ```bash
 tmux new -s report
+source .venv/bin/activate
 scripts/run_fft_experiments.sh baselines      # minutes: B1/B2, Set14 tests, data check
 scripts/run_fft_experiments.sh sweep          # V1: lowpass with λ = 0.01, 0.05, 0.1
 ```
@@ -94,7 +99,7 @@ In each test folder:
 
 `final_results/bilinear/` and `bicubic/` hold the summary JSONs. `final_results/summary.csv` is the report table.
 
-`experiment/`, `results/` and `Test_Datasets/` are git-ignored, so intermediate checkpoints, SR images and datasets stay on the server.
+`experiment/`, `results/`, `downloads/` and the dataset folders' contents are git-ignored, so intermediate checkpoints, SR images and datasets stay on the server.
 
 ## Reporting notes
 - Bicubic reproduces the literature values here: Set5 33.64 dB (paper 33.66), Set14 30.31 (30.24), BSDS300 test 29.55 (BSD100: 29.56). This is the proposal's sanity check.

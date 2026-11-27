@@ -2,19 +2,24 @@
 # First-time dataset download + preparation for a new GPU server. Safe to re-run: every step whose
 # output already exists is skipped. Run from anywhere; uses the repo's .venv python if present.
 #
+# By default everything goes inside the repo (no special permissions needed), into the placeholder folders
+# div2k/, set14/, bsds300/, manga109/ and Test_Datasets/ (git-ignored apart from their .gitkeep). That is also
+# where train.py/test.py find the benchmark sets without any extra flags. Needs ~20 GB free while running.
+#
 #   DIV2K train (x2)  ETH Zurich zips (~4.4 GB)  -> $DATA/div2k/DF2K_decoded/{DIV2K_train_HR,DIV2K_train_LR_bicubic/X2} (.npy)
 #   Set5              github linzino7/Set5-dataset -> <repo>/Test_Datasets/{Set5,Set5_LR/x2}  (same source as the DWT runs)
 #   Set14             github jbhuang0604/SelfExSR (the source named in the proposal) -> $DATA/set14/{Set14_HR,Set14_LR_x2}
 #   BSDS300           Berkeley tgz (22 MB), test split -> $DATA/bsds300/{HR,LR/x2} via scripts/prepare_benchmarks.py
 #   Manga109          licence-restricted, cannot be downloaded automatically (see the message at the end)
 #
-# Env: DATA (default /data/data), PY (default <repo>/.venv/bin/python), KEEP_ZIPS=1 to keep the archives,
+# Env: DATA (default "." = the repo root; paths are relative to it), PY (default <repo>/.venv/bin/python), KEEP_ZIPS=1 to keep the archives,
 #      SKIP_DIV2K=1 to only fetch the small benchmark sets.
 set -euo pipefail
 REPO=$(cd "$(dirname "$0")/.." && pwd)
-DATA=${DATA:-/data/data}
+cd "$REPO"   # all paths below are relative to the repo root
+DATA=${DATA:-.}
 if [ -z "${PY:-}" ]; then
-  if [ -x "$REPO/.venv/bin/python" ]; then PY="$REPO/.venv/bin/python"; else PY=python; fi
+  if [ -x .venv/bin/python ]; then PY=.venv/bin/python; else PY=python; fi
 fi
 DL=$DATA/downloads
 mkdir -p "$DATA" "$DL"
@@ -44,14 +49,14 @@ if [ "${SKIP_DIV2K:-0}" != 1 ]; then
     [ "$(count "$RAW/DIV2K_train_HR" '*.png')" -ge 800 ] || unzip -q -o "$DL/DIV2K_train_HR.zip" -d "$RAW"
     [ "$(count "$RAW/DIV2K_train_LR_bicubic/X2" '*.png')" -ge 800 ] || unzip -q -o "$DL/DIV2K_train_LR_bicubic_X2.zip" -d "$RAW"
     mkdir -p "$(dirname "$NPY")"
-    "$PY" "$REPO/scripts/png2npy.py" --pathFrom "$RAW/" --pathTo "$NPY/" | grep -E "Converted (800|[0-9]*00) " | tail -2 || true
+    "$PY" "scripts/png2npy.py" --pathFrom "$RAW/" --pathTo "$NPY/" | grep -E "Converted (800|[0-9]*00) " | tail -2 || true
     echo "[DIV2K] HR $(count "$NPY/DIV2K_train_HR" '*.npy') / LR $(count "$NPY/DIV2K_train_LR_bicubic/X2" '*.npy') .npy files"
     [ "${KEEP_ZIPS:-0}" = 1 ] || { rm -rf "$RAW"; rm -f "$DL"/DIV2K_*.zip; }
   fi
 fi
 
 # ---------------------------------------------------------------- Set5 (repo-relative, as train.py expects)
-S5=$REPO/Test_Datasets
+S5=Test_Datasets
 if [ "$(count "$S5/Set5" '*.png')" -eq 5 ] && [ "$(count "$S5/Set5_LR/x2" '*.png')" -eq 5 ]; then
   echo "[Set5] already in $S5"
 else
@@ -86,26 +91,26 @@ else
   fetch "https://www2.eecs.berkeley.edu/Research/Projects/CS/vision/bsds/BSDS300-images.tgz" "$DL/BSDS300-images.tgz"
   mkdir -p "$B"
   [ -f "$B/iids_test.txt" ] || tar -xzf "$DL/BSDS300-images.tgz" -C "$B" --strip-components=1
-  "$PY" "$REPO/scripts/prepare_benchmarks.py" --data_root "$DATA" --sets bsds300
+  "$PY" "scripts/prepare_benchmarks.py" --data_root "$DATA" --sets bsds300
 fi
 
 # ---------------------------------------------------------------- Manga109 (manual)
 M=$DATA/manga109
 if [ "$(count "$M/HR" '*.png')" -eq 109 ]; then
   echo "[Manga109] already in $M"
-elif [ -d "$M/images" ] && [ -f "$REPO/scripts/manga109_official.json" ]; then
+elif [ -d "$M/images" ] && [ -f "scripts/manga109_official.json" ]; then
   echo "[Manga109] preparing the official 109-image benchmark"
-  "$PY" "$REPO/scripts/prepare_benchmarks.py" --data_root "$DATA" --sets manga109
+  "$PY" "scripts/prepare_benchmarks.py" --data_root "$DATA" --sets manga109
 else
   cat <<EOF
 [Manga109] NOT prepared (needs manual steps):
   1. Manga109 is licence-restricted: request it at http://www.manga109.org/en/download.html and unpack it
      so that $M/images/<Book>/000.jpg exists.
   2. Get scripts/manga109_official.json from Josh (it defines the 109 benchmark crops used for the DWT
-     results and is not in the repo), copy it to $REPO/scripts/, then re-run this script.
+     results and is not in the repo), copy it to scripts/, then re-run this script.
   Everything else (training, Set5/Set14/BSDS300 results) works without it; Manga109 rows will show '-'.
 EOF
 fi
 
 echo
-"$PY" "$REPO/scripts/check_setup.py" --root "$DATA/div2k" --bench_root "$DATA" || true
+"$PY" scripts/check_setup.py --root "$DATA/div2k" --bench_root "$DATA" || true

@@ -76,8 +76,8 @@ def main():
     p.add_argument("--sets", default="set5,set14,bsds300,manga109")
     p.add_argument("--methods", default="bilinear,bicubic")
     p.add_argument("--scale", type=int, default=2)
-    p.add_argument("--bench_root", default=benchmarks.DEFAULT_BENCH_ROOT)
-    p.add_argument("--out_root", default=os.path.join(ROOT, "final_results"))
+    p.add_argument("--bench_root", default=".", help="benchmark root, relative to the repo root")
+    p.add_argument("--out_root", default="final_results")
     a = p.parse_args()
     os.chdir(ROOT)  # benchmark paths such as Test_Datasets/Set5 are relative to the repo
 

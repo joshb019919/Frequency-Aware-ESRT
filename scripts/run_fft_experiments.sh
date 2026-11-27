@@ -22,7 +22,8 @@
 #   scripts/run_fft_experiments.sh baselines
 #   scripts/run_fft_experiments.sh sweep
 #   LAMBDA=0.05 scripts/run_fft_experiments.sh dwt
-# Env: ROOT (DIV2K dir, default /data/data/div2k), BENCH (benchmark root, default /data/data),
+# Env: ROOT (DIV2K dir, default div2k), BENCH (benchmark root, default "." = repo root; another location is
+#      linked into the repo's set14/ bsds300/ manga109/ folders, because train.py validation looks there),
 #      RUN (run id, default run_fft), PY (default .venv/bin/python, else python), EPOCHS (default 1000),
 #      GPUS (comma-separated GPU ids for parallel training; default: every GPU found, else 0),
 #      TEST_FAST (--fast | --no-fast for Set14/BSDS300/Manga109 tests; default: what `baselines` found),
@@ -32,8 +33,19 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 PHASE=${1:?usage: $0 baselines|sweep|dwt [experiments.py args...]}; shift
-ROOT=${ROOT:-/data/data/div2k}
-BENCH=${BENCH:-/data/data}
+ROOT=${ROOT:-div2k}      # relative to the repo root (the script cd-s there first)
+BENCH=${BENCH:-.}
+# train.py validates on Set5 + Set14 and experiments.py cannot pass it a benchmark root, so the sets must be
+# reachable from the repo (data/benchmarks.py tries repo-relative paths first). Link them in if they live elsewhere.
+if [ "$(cd "$BENCH" 2>/dev/null && pwd)" != "$PWD" ]; then
+  for set in set14 bsds300 manga109; do
+    [ -d "$BENCH/$set" ] || continue
+    mkdir -p "$set"
+    for sub in "$BENCH/$set"/*; do
+      if [ -e "$sub" ] && [ ! -e "$set/$(basename "$sub")" ]; then ln -s "$sub" "$set/$(basename "$sub")"; fi
+    done
+  done
+fi
 RUN=${RUN:-run_fft}
 if [ -z "${PY:-}" ]; then
   if [ -x .venv/bin/python ]; then PY=.venv/bin/python; else PY=python; fi

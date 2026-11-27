@@ -4,7 +4,8 @@ Checks CUDA, the Python packages, the DIV2K training data, the benchmark sets (w
 the DWT results were produced with) and the lowpass baseline in final_results/. Prints one line per
 check and exits 1 if anything required is missing.
 
-  python scripts/check_setup.py --root /data/data/div2k --bench_root /data/data
+  python scripts/check_setup.py                       # data inside the repo (the default)
+  python scripts/check_setup.py --root /elsewhere/div2k --bench_root /elsewhere
 """
 import argparse
 import importlib
@@ -35,8 +36,8 @@ def count(d):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--root", default="/data/data/div2k", help="train.py --root (holds DF2K_decoded/)")
-    p.add_argument("--bench_root", default="/data/data", help="benchmark root (set14/, bsds300/, manga109/)")
+    p.add_argument("--root", default="div2k", help="train.py --root (holds DF2K_decoded/); relative to the repo root")
+    p.add_argument("--bench_root", default=".", help="benchmark root (set14/, bsds300/, manga109/)")
     p.add_argument("--scale", type=int, default=2)
     a = p.parse_args()
     os.chdir(ROOT)
