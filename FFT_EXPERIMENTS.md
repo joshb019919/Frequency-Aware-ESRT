@@ -1,84 +1,103 @@
-# Frequency-loss (FFT) experiments: GPU server runbook
+# Report experiments on a GPU server: runbook
 
-These runs give the FFT-loss rows (V1 and V3 in the proposal) to go next to the DWT results already in `final_results/`.
-The settings match the DWT runs (×2, patch 96, 1000 epochs, seed 1, batch 16, `--fast`, bf16). Only the loss changes:
+Produces everything still missing for the report, next to the DWT results already in `final_results/`.
 
-L = ‖SR − HR‖₁ + λ · ‖FFT(SR) − FFT(HR)‖₁ (`losses.py`, `--freq_loss_lambda`)
-
-| Phase | Configs | Proposal | Runs (≈7 h each) |
+| Phase | What | Proposal | Time |
 |---|---|---|---|
-| — | `lowpass`, `dwt_c1_gr1_norm`, `dwt_c3_gr1_skipnorm`, `dwt_cband_gr1_skipnorm` | V0, V2 | already in `final_results/` |
-| `sweep` | `lowpass_fl0.01`, `lowpass_fl0.05`, `lowpass_fl0.1` | V1 + λ study | 3 |
-| `dwt` | the three DWT configs at the best λ, e.g. `dwt_c3_gr1_skipnorm_fl0.05` | V3 | 3 |
+| — | `lowpass` + 3 DWT configs (Set5, BSDS300, Manga109) | V0, V2 | done, in `final_results/` |
+| `baselines` | bilinear + bicubic on all sets; Set14 tests of the 4 committed models; data check | B1, B2 | minutes |
+| `sweep` | `lowpass` + FFT loss, λ = 0.01 / 0.05 / 0.1 | V1 + λ study | ~7 h per config |
+| `dwt` | the 3 DWT configs + FFT loss at the best λ | V3 | ~7 h per config |
 
-The finished `final_results/lowpass` is reused as the baseline and the plot reference. It is not retrained.
+Training uses the same settings as the DWT runs (×2, patch 96, 1000 epochs, seed 1, batch 16, `--fast`, bf16). Only the loss changes:
 
-## 1. Clone and install
+L = ‖SR − HR‖₁ + λ · ‖FFT(SR) − FFT(HR)‖₁
+
+Configs train **one per GPU in parallel**. GPUs are detected automatically, so two GPUs make each phase about 14 h. All commands run from the repo root.
+
+## 1. Clone and create the venv
 
 ```bash
 git clone -b dev/fft https://github.com/joshb019919/Frequency-Aware-ESRT.git
 cd Frequency-Aware-ESRT
-python -m venv .venv && source .venv/bin/activate
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124   # match the server's CUDA
-pip install -r requirements.txt
+python3 -m venv .venv
+.venv/bin/pip install --upgrade pip
+.venv/bin/pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124   # match `nvidia-smi` CUDA version
+.venv/bin/pip install -r requirements.txt
 ```
 
-## 2. Data
+All the scripts below use `.venv/bin/python` automatically. Set `PY=/path/to/python` to override.
 
-All paths are the defaults. If yours differ, pass `--root` / `--bench_root` to `check_setup.py` and set `ROOT=` for the run.
-
-| What | Where |
-|---|---|
-| DIV2K train, `.npy` (`scripts/png2npy.py`) | `/data/data/div2k/DF2K_decoded/DIV2K_train_HR/`, `.../DIV2K_train_LR_bicubic/X2/` |
-| Set5 (validation + experiments.py test) | `Test_Datasets/Set5/`, `Test_Datasets/Set5_LR/x2/` (in the repo folder) |
-| Set14 (validation) | `/data/data/set14/Set14_HR/`, `/data/data/set14/Set14_LR_x2/` |
-| BSDS300 test split, Manga109 | `/data/data/bsds300/`, `/data/data/manga109/`, then `python scripts/prepare_benchmarks.py` |
-
-**Manga109:** the DWT results used the official 109-image list. That needs `scripts/manga109_official.json`, which is **not in the repo**. Copy it from the machine that produced the DWT results, or copy the prepared `/data/data/manga109/HR` and `LR/x2` folders. Without it, the Manga109 numbers are not comparable.
-
-If you're on the same server as the DWT runs, this is all already in place.
-
-## 3. Preflight
+## 2. Download the data (first time only, re-runnable)
 
 ```bash
-python scripts/check_setup.py              # must end with "all required checks passed"
-DRY_RUN=1 scripts/run_fft_experiments.sh sweep   # prints every command, runs nothing
+DATA=/data/data scripts/download_data.sh
 ```
 
-## 4. Run
+| Set | Source | Goes to |
+|---|---|---|
+| DIV2K train ×2 (~4.4 GB, converted to `.npy`) | ETH Zurich | `$DATA/div2k/DF2K_decoded/` |
+| Set5 | `linzino7/Set5-dataset` (same as the DWT runs) | `Test_Datasets/` in the repo (git-ignored) |
+| Set14 | Jia-Bin Huang's SelfExSR (named in the proposal) | `$DATA/set14/` |
+| BSDS300 test split | Berkeley | `$DATA/bsds300/` |
+| Manga109 | **manual**: licence from manga109.org, unpacked to `$DATA/manga109/images/`, plus `scripts/manga109_official.json` from Josh | `$DATA/manga109/` |
 
-Use `tmux` or `nohup`, since each phase takes about 21 h on one GPU.
+The script ends by running `scripts/check_setup.py`, which must report "all required checks passed". Manga109 is the one optional set: without it, the Manga109 column shows `-` and everything else still runs.
+
+If `$DATA` is not `/data/data`, pass `ROOT=$DATA/div2k BENCH=$DATA` to the run commands below.
+
+## 3. Run
+
+Use `tmux`, because the training phases run for hours:
 
 ```bash
-tmux new -s fft
-scripts/run_fft_experiments.sh sweep 2>&1 | tee fft_sweep.log
+tmux new -s report
+scripts/run_fft_experiments.sh baselines      # minutes: B1/B2, Set14 tests, data check
+scripts/run_fft_experiments.sh sweep          # V1: lowpass with λ = 0.01, 0.05, 0.1
 ```
 
-Pick the λ with the best PSNR (averaged over Set5, BSDS300 and Manga109) from the table printed at the end, then:
+Pick the λ with the best PSNR in the printed table (look at all test sets, not only Set5), then:
 
 ```bash
-LAMBDA=0.05 scripts/run_fft_experiments.sh dwt 2>&1 | tee fft_dwt.log
+LAMBDA=0.05 scripts/run_fft_experiments.sh dwt
 ```
 
-Re-running the same command resumes: finished configs are skipped. Logs while training: `tail -f experiment/run_fft/exp_<config>/train.log`.
+- **Preview first:** `DRY_RUN=1 scripts/run_fft_experiments.sh <phase>` prints every command and the GPU assignment without running anything.
+- **Progress:** `tail -f experiment/run_fft_gpu*/worker.log` (per config: `experiment/run_fft_gpu<N>/exp_<config>/train.log`).
+- **GPUs:** detected automatically. Use `GPUS=1` for one specific GPU, or `GPUS=0,1,2,3` for a list. Each GPU gets its own run folder `experiment/run_fft_gpu<N>/`, so parallel workers never share files.
+- **Resume:** run the same command again. Finished configs are skipped, interrupted ones restart, and this works even with a different number of GPUs.
 
-The script, for each config:
-1. trains and tests on Set5 (`experiments.py`; summary CSVs go to `experiment/experiments_run_fft*.csv`);
-2. tests on BSDS300 and Manga109, with lowpass as the dashed reference line;
-3. copies everything to `final_results/<config>/` in the same layout as the DWT folders;
-4. prints the combined DWT + FFT table (`python scripts/summarize_results.py --csv final_results/summary.csv` writes it as a CSV).
+**About the data check** (in `baselines`): it re-tests the committed `lowpass` checkpoint on this machine's data, in both `--fast` and `--no-fast` mode, and compares every image with the committed numbers.
+- On a match, it records the mode and the later phases test the same way, so the new rows are directly comparable with the DWT rows.
+- On a mismatch, it prints a warning. Usually this means different benchmark files; then re-test the committed models here before comparing.
 
-Optional env vars: `RUN` (run id, default `run_fft`), `ROOT`, `PY`, `EPOCHS`, `TEST_FAST=--no-fast` (fp32 testing; then re-test lowpass the same way for a fair comparison).
-
-## 5. Bring the results back
+## 4. Save and push the results
 
 ```bash
-cp experiment/experiments_run_fft*.csv final_results/     # optional: per-run summary CSVs
-git add final_results && git commit -m "Add FFT-loss experiment results" && git push
+.venv/bin/python scripts/summarize_results.py --csv final_results/summary.csv
+cp experiment/experiments_run_fft_gpu*.csv final_results/ 2>/dev/null || true
+git add final_results
+git commit -m "Add baseline, Set14 and FFT-loss results"
+git push origin dev/fft
 ```
 
-`experiment/` and `results/` are git-ignored, so intermediate checkpoints and SR images stay on the server.
+Each `final_results/<config>/` folder then holds:
+- `epoch_1000.pth`
+- `curves.png` and `freq_curves.png`
+- `history.json`, `train.log` and `test.log`
+- the Set5 test files at the top level, plus `set14/`, `bsds300/` and `manga109/` subfolders
+
+In each test folder:
+- `test_x2.png`, the PSNR/SSIM plot
+- `test_x2_freq.png` and `test_x2_freq.csv`, the frequency metrics
+- `test_x2_summary.json`, the per-image PSNR/SSIM
+
+`final_results/bilinear/` and `bicubic/` hold the summary JSONs. `final_results/summary.csv` is the report table.
+
+`experiment/`, `results/` and `Test_Datasets/` are git-ignored, so intermediate checkpoints, SR images and datasets stay on the server.
 
 ## Reporting notes
-- The DWT differences are 0.01–0.04 dB from a single seed, below the `--fast`/bf16 effect (0.02–0.1 dB, see COMMANDS.md). Report FFT gains on the same footing. If they are this small, say "no measurable difference" unless they're confirmed with more seeds or `--no-fast` tests.
-- The loss is computed on RGB because the model is RGB-only. PSNR/SSIM are on Y, as for the DWT runs.
+- Bicubic reproduces the literature values here: Set5 33.64 dB (paper 33.66), Set14 30.31 (30.24), BSDS300 test 29.55 (BSD100: 29.56). This is the proposal's sanity check.
+- Set5 and Set14 are also the validation sets during training. Checkpoints are never selected by validation score (always epoch 1000), so testing on them is fine, but mention it.
+- The DWT differences are 0.01–0.04 dB from a single seed, below the `--fast`/bf16 effect (0.02–0.1 dB, see COMMANDS.md). Treat FFT gains the same way. If they are this small, call them "no measurable difference".
+- The loss is computed on RGB because the model is RGB-only. PSNR/SSIM are on Y, like everything else.

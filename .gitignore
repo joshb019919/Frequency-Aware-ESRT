@@ -8,6 +8,8 @@ experiments/
 # Finished results are copied to final_results/, which is tracked.
 experiment/
 results/
+# Downloaded benchmark images (scripts/download_data.sh); licence terms vary, never commit them.
+Test_Datasets/
 
 # C extensions
 *.so

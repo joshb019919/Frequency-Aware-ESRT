@@ -1,7 +1,7 @@
 """Print (and optionally save) the report table: mean PSNR/SSIM per config and test set.
 
-Reads final_results/<config>/test_x<scale>_summary.json (Set5) and the bsds300/ and manga109/
-subfolders, plus the epoch count and parameter-free metadata in the folder name. Delta columns are
+Reads final_results/<config>/test_x<scale>_summary.json (Set5) and the set14/, bsds300/ and manga109/
+subfolders (a set that was not tested shows '-'). Delta columns are
 PSNR differences against the lowpass baseline.
 
   python scripts/summarize_results.py                  # print a markdown table
@@ -12,7 +12,8 @@ import csv
 import json
 import os
 
-SETS = (("Set5", ""), ("BSDS300", "bsds300"), ("Manga109", "manga109"))
+SETS = (("Set5", ""), ("Set14", "set14"), ("BSDS300", "bsds300"), ("Manga109", "manga109"))
+BASELINES = ("bilinear", "bicubic")  # scripts/interp_baselines.py
 
 
 def mean_scores(path):
@@ -38,9 +39,11 @@ def collect(root, scale):
 
 
 def order(cfg):
-    """lowpass first, then lowpass_fl*, then dwt configs, each followed by their _fl copies."""
+    """bilinear, bicubic, lowpass, lowpass_fl*, then dwt configs each followed by their _fl copies."""
+    if cfg in BASELINES:
+        return (0, BASELINES.index(cfg), "", -1.0)
     base, _, lam = cfg.partition("_fl")
-    return (base != "lowpass", base, float(lam) if lam else -1.0)
+    return (1 if base == "lowpass" else 2, 0, base, float(lam) if lam else -1.0)
 
 
 def main():
