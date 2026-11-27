@@ -11,6 +11,8 @@
 #   dwt        V3: the three DWT configs trained with one lambda ($LAMBDA)
 #              Each phase is 3 configs of ~7 h, trained one per GPU in parallel (2 GPUs: ~14 h, 3+: ~7 h).
 #              Worker run folders: experiment/<RUN>_gpu<N>/ (one experiments.py per GPU, unchanged Python).
+#   window     V4 (stretch): DWT_CONFIG + FFT loss (LAMBDA) + spatial window attention, and lowpass_win
+#              (window attention alone, isolates its effect). 2 configs, one per GPU (~7 h).
 #
 # Training uses the same settings as the DWT runs (x2, patch 96, 1000 epochs, seed 1, --fast, bf16): only the
 # loss changes. final_results/lowpass is reused as the baseline/plot reference (copied into the run folder,
@@ -22,6 +24,7 @@
 #   scripts/run_fft_experiments.sh baselines
 #   scripts/run_fft_experiments.sh sweep
 #   LAMBDA=0.05 scripts/run_fft_experiments.sh dwt
+#   LAMBDA=0.05 DWT_CONFIG=dwt_c3_gr1_skipnorm scripts/run_fft_experiments.sh window
 # Env: ROOT (DIV2K dir, default div2k), BENCH (benchmark root, default "." = repo root; another location is
 #      linked into the repo's set14/ bsds300/ manga109/ folders, because train.py validation looks there),
 #      RUN (run id, default run_fft), PY (default .venv/bin/python, else python), EPOCHS (default 1000),
@@ -32,7 +35,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-PHASE=${1:?usage: $0 baselines|sweep|dwt [experiments.py args...]}; shift
+PHASE=${1:?usage: $0 baselines|sweep|dwt|window [experiments.py args...]}; shift
 ROOT=${ROOT:-div2k}      # relative to the repo root (the script cd-s there first)
 BENCH=${BENCH:-.}
 # train.py validates on Set5 + Set14 and experiments.py cannot pass it a benchmark root, so the sets must be
@@ -68,7 +71,14 @@ fi
 TEST_SETS="set14 bsds300 manga109"     # Set5 is tested by experiments.py (top level of each config folder)
 DWT_CONFIGS="dwt_c3_gr1_skipnorm dwt_c1_gr1_norm dwt_cband_gr1_skipnorm"
 
-flags_for() {  # model flags of a base config (must match how it was trained)
+flags_for() {  # model flags of a config name (must match how it was trained): <base>[_fl<l>][_win]
+  local name=$1 extra=""
+  if [ "${name%_win}" != "$name" ]; then name=${name%_win}; extra="--attn window"; fi
+  name=${name%_fl*}
+  echo "$(base_flags "$name") $extra"
+}
+
+base_flags() {
   case "$1" in
     lowpass)                echo "" ;;
     dwt_c1_gr1_norm)        echo "--freq dwt --conv 1 --global_res 1 --ll_norm 1" ;;
@@ -165,17 +175,22 @@ if [ "$PHASE" = baselines ]; then
 fi
 
 # ------------------------------------------------------------------------------------------- sweep / dwt
-case "$PHASE" in
-  sweep) LAMBDAS=${LAMBDAS:-0.01,0.05,0.1}; BASES="lowpass" ;;
-  dwt)   LAMBDAS=${LAMBDA:?set LAMBDA to the best value from the sweep, e.g. LAMBDA=0.05}; BASES=$DWT_CONFIGS ;;
-  *) echo "phase must be baselines, sweep or dwt" >&2; exit 1 ;;
-esac
-
-# Config names experiments.py will create: <base>_fl<lambda> ({:g} formatting, e.g. 0.10 -> 0.1).
+fmt_lambda() { "$PY" -c "print('{:g}'.format(float('$1')))"; }   # experiments.py names: 0.10 -> 0.1
+WINDOW_FLAG=()
 NAMES=()
-for b in $BASES; do
-  for l in ${LAMBDAS//,/ }; do NAMES+=("${b}_fl$("$PY" -c "print('{:g}'.format(float('$l')))")"); done
-done
+case "$PHASE" in
+  sweep) LAMBDAS=${LAMBDAS:-0.01,0.05,0.1}
+         for l in ${LAMBDAS//,/ }; do NAMES+=("lowpass_fl$(fmt_lambda "$l")"); done ;;
+  dwt)   LAMBDAS=${LAMBDA:?set LAMBDA to the best value from the sweep, e.g. LAMBDA=0.05}
+         for b in $DWT_CONFIGS; do NAMES+=("${b}_fl$(fmt_lambda "$LAMBDAS")"); done ;;
+  window) # V4 = best DWT config + FFT loss + window attention, plus the window-only control on lowpass.
+         LAMBDAS=${LAMBDA:?set LAMBDA to the lambda used for the dwt phase, e.g. LAMBDA=0.05}
+         DWT_CONFIG=${DWT_CONFIG:?set DWT_CONFIG to the best DWT config, e.g. DWT_CONFIG=dwt_c3_gr1_skipnorm}
+         case " $DWT_CONFIGS " in *" $DWT_CONFIG "*) ;; *) echo "DWT_CONFIG must be one of: $DWT_CONFIGS" >&2; exit 1 ;; esac
+         NAMES=("${DWT_CONFIG}_fl$(fmt_lambda "$LAMBDAS")_win" "lowpass_win")
+         WINDOW_FLAG=(--window) ;;
+  *) echo "phase must be baselines, sweep, dwt or window" >&2; exit 1 ;;
+esac
 ONLY=$(IFS=,; echo "${NAMES[*]}")
 
 # Train + Set5 test. Configs that are not finished yet are spread round-robin over $GPUS; each GPU runs its
@@ -197,7 +212,7 @@ for i in "${!GPU_LIST[@]}"; do
   wrun=${RUN}_gpu$g
   seed_reference "$wrun"
   cmd=("$PY" experiments.py --root "$ROOT" --run_id "$wrun" --epochs "$EPOCHS" --scale $SCALE
-       --freq_lambdas "$LAMBDAS" --only "$only" --force "$@")   # --force: only unfinished configs are passed,
+       --freq_lambdas "$LAMBDAS" ${WINDOW_FLAG[@]+"${WINDOW_FLAG[@]}"} --only "$only" --force "$@")   # --force: only unfinished configs are passed,
                                                                   # so it just restarts interrupted ones
   log=experiment/$wrun/worker.log
   echo "GPU $g -> $only   (run folder experiment/$wrun, log $log)"
@@ -226,7 +241,7 @@ for name in "${NAMES[@]}"; do
   ckpt=$exp/epoch_$EPOCHS.pth
   for set in $TEST_SETS; do
     echo "[$name] $set"
-    test_one "$ckpt" "${name%_fl*}" "$set" "$exp/$set" "$TEST_FAST" "final_results/lowpass/$set"
+    test_one "$ckpt" "$name" "$set" "$exp/$set" "$TEST_FAST" "final_results/lowpass/$set"
   done
   if [ "$DRY_RUN" = 1 ]; then echo "+ package $exp -> final_results/$name"; continue; fi
   out=final_results/$name

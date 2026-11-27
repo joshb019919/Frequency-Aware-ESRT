@@ -25,13 +25,14 @@ from util.non  import NONLocalBlock2D
 from util.tools import extract_image_patches,\
     reduce_mean, reduce_sum, same_padding, reverse_patches
 
-from util.transformer import drop_path, DropPath, PatchEmbed, Mlp,MLABlock
+from util.transformer import drop_path, DropPath, PatchEmbed, Mlp,MLABlock, ATTN_CHOICES
 from util.position import PositionEmbeddingLearned, PositionEmbeddingSine
 import pdb
 import math
 from model import dwt
 
 FREQ_CHOICES = ('lowpass', 'dwt')
+WINDOW_SIZE = 24   # 4 windows of 576 tokens on a 48x48 training patch = ESRT's 4 strips of 576
 CONV_CHOICES = (1, 3, 'band')
 
 
@@ -50,6 +51,21 @@ def add_model_args(parser):
     parser.add_argument('--ll_norm', type=int, choices=[0, 1], default=0,
                         help='1 = decoder_low sees LL/2 (= average-pool scale), rescaled x2 before IDWT '
                              '(needs --freq dwt)')
+    parser.add_argument('--attn', choices=ATTN_CHOICES, default='split',
+                        help='transformer token grouping: split (original ESRT feature split, horizontal strips) '
+                             'or window (M x M spatial windows, Swin-style; util/transformer.WindowAttention)')
+    parser.add_argument('--window_size', type=int, default=None,
+                        help='window side M for --attn window (default {})'.format(WINDOW_SIZE))
+    parser.add_argument('--window_shift', type=int, choices=[0, 1], default=None,
+                        help='1 = half the heads use windows shifted by M/2 (default); 0 = no shift (--attn window)')
+
+
+def _attn_args(args):
+    """(attn, window_size, window_shift) from parsed args; works for parsers without the attn flags."""
+    attn = getattr(args, 'attn', 'split')
+    size, shift = getattr(args, 'window_size', None), getattr(args, 'window_shift', None)
+    return attn, (WINDOW_SIZE if size is None else size), (True if shift is None else bool(shift)), \
+        (size is not None or shift is not None)
 
 
 def model_kwargs(args):
@@ -59,25 +75,37 @@ def model_kwargs(args):
             or args.dwt_skip or args.ll_norm):
         kw = dict(freq=args.freq, dwt_conv=args.conv, global_res=bool(args.global_res),
                   dwt_skip=bool(args.dwt_skip), ll_norm=bool(args.ll_norm))
+    attn, size, shift, given = _attn_args(args)
+    if attn != 'split' or given:
+        kw.update(attn=attn, window_size=size, window_shift=shift, window_given=given)
     return kw
 
 
 def variant_tag(args):
-    """Folder suffix identifying the flag combination ('' for the default model)."""
-    if args.freq == 'lowpass':
-        return ''
-    return '_dwt_c{}_gr{}{}{}'.format(args.conv or 1, args.global_res,
-                                      '_sk' if args.dwt_skip else '', '_nm' if args.ll_norm else '')
+    """Folder suffix identifying the flag combination ('' for the default model).
+
+    Unchanged for every split-attention model; --attn window appends _win<M> (_win<M>ns without shift).
+    """
+    tag = ''
+    if args.freq != 'lowpass':
+        tag = '_dwt_c{}_gr{}{}{}'.format(args.conv or 1, args.global_res,
+                                         '_sk' if args.dwt_skip else '', '_nm' if args.ll_norm else '')
+    attn, size, shift, _ = _attn_args(args)
+    if attn == 'window':
+        tag += '_win{}{}'.format(size, '' if shift else 'ns')
+    return tag
 
 
-def make_model(upscale=4, freq='lowpass', dwt_conv=None, global_res=True, dwt_skip=False, ll_norm=False):
+def make_model(upscale=4, freq='lowpass', dwt_conv=None, global_res=True, dwt_skip=False, ll_norm=False,
+               attn='split', window_size=WINDOW_SIZE, window_shift=True):
     """Factory returning an ESRT model for the given upscale factor."""
     # inpu = torch.randn(1, 3, 320, 180).cpu()
     # flops, params = profile(RTC(upscale).cpu(), inputs=(inpu,))
     # print(params)
     # print(flops)
     return ESRT(upscale=upscale, freq=freq, dwt_conv=dwt_conv, global_res=global_res,
-                dwt_skip=dwt_skip, ll_norm=ll_norm)
+                dwt_skip=dwt_skip, ll_norm=ll_norm, attn=attn, window_size=window_size,
+                window_shift=window_shift)
 
 
 ## Channel Attention (CA) Layer
@@ -286,7 +314,8 @@ class Un(nn.Module):
     The attention dim=288 equals n_feats(32) * 3 * 3, i.e. one flattened 3x3
     patch per token, so it is tied to n_feats=32.
     """
-    def __init__(self,n_feats, wn, freq='lowpass', dwt_conv=1, dwt_skip=False, ll_norm=False):
+    def __init__(self,n_feats, wn, freq='lowpass', dwt_conv=1, dwt_skip=False, ll_norm=False,
+                 attn='split', window_size=WINDOW_SIZE, window_shift=True):
         super(Un, self).__init__()
         self.encoder1 = Updownblock(n_feats, freq, dwt_conv, dwt_skip, ll_norm)
         self.encoder2 = Updownblock(n_feats, freq, dwt_conv, dwt_skip, ll_norm)
@@ -294,7 +323,8 @@ class Un(nn.Module):
         self.reduce = common.default_conv(3*n_feats, n_feats, 3)
         self.weight2 = common.Scale(1)
         self.weight1 = common.Scale(1)
-        self.attention = MLABlock(n_feat=n_feats, dim=288) 
+        self.attention = MLABlock(n_feat=n_feats, dim=288, attn=attn, window_size=window_size,
+                                  window_shift=window_shift)
         self.alise = common.default_conv(n_feats, n_feats, 3)
 
     def forward(self,x):
@@ -323,8 +353,13 @@ class ESRT(nn.Module):
     Uses n_feats=32 feature channels and a single `Un` body block.
     """
     def __init__(self, upscale=4, conv=common.default_conv, freq='lowpass', dwt_conv=None, global_res=True,
-                 dwt_skip=False, ll_norm=False):
+                 dwt_skip=False, ll_norm=False, attn='split', window_size=WINDOW_SIZE, window_shift=True,
+                 window_given=False):
         super(ESRT, self).__init__()
+        if attn not in ATTN_CHOICES:
+            raise ValueError("attn must be one of {}, got {!r}".format(ATTN_CHOICES, attn))
+        if attn == 'split' and window_given:
+            raise ValueError("--window_size / --window_shift are only valid with --attn window")
         if freq not in FREQ_CHOICES:
             raise ValueError("freq must be one of {}, got {!r}".format(FREQ_CHOICES, freq))
         if freq == 'lowpass' and dwt_conv is not None:
@@ -362,7 +397,8 @@ class ESRT(nn.Module):
         for i in range(n_blocks):
             modules_body.append(
                 Un(n_feats=n_feats, wn = wn, freq=freq, dwt_conv=dwt_conv,
-                   dwt_skip=dwt_skip, ll_norm=ll_norm))
+                   dwt_skip=dwt_skip, ll_norm=ll_norm, attn=attn, window_size=window_size,
+                   window_shift=window_shift))
 
         # define tail module (upsample deep features, project back to RGB)
         modules_tail = [

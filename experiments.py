@@ -8,6 +8,7 @@ recorded and does not stop the others.
 Configs (7 per patch size): lowpass; dwt with --conv {1,3,band} x --global_res {1,0}.
 --dwt_tweaks skip,norm,skipnorm adds the dwt configs again with the architectural tweaks
 (--dwt_skip 1 / --ll_norm 1 / both), named <config>_<tweak>; `skip` is not run for conv band.
+--window adds every config again with spatial window attention (--attn window), named <config>_win.
 --freq_lambdas 0.01,0.05,0.1 adds every config again trained with L1 + lambda * FFT-L1
 (losses.py), named <config>_fl<lambda>.
 --patch_size {96,144,both} (default 96) sets the HR training patch; `both` runs every
@@ -49,7 +50,7 @@ TWEAKS = {"skip": ["--dwt_skip", "1"], "norm": ["--ll_norm", "1"],
           "skipnorm": ["--dwt_skip", "1", "--ll_norm", "1"]}
 
 
-def build_configs(patch_sizes=(96,), tweaks=(), freq_lambdas=()):
+def build_configs(patch_sizes=(96,), tweaks=(), freq_lambdas=(), window=False):
     """Return [(name, [flags...], patch)] for every variant x patch size.
 
     Variants: lowpass + dwt x conv x global_res. A patch size other than 96 adds a
@@ -78,6 +79,8 @@ def build_configs(patch_sizes=(96,), tweaks=(), freq_lambdas=()):
     # Frequency-loss copies of every config so far (V1 = lowpass + loss, V3 = dwt + loss).
     cfgs += [(n + loss_tag(lam), f + ["--freq_loss_lambda", "{:g}".format(lam)], ps)
              for lam in freq_lambdas for n, f, ps in list(cfgs)]
+    if window:  # window-attention copies of every config so far (V4 = dwt + loss + window)
+        cfgs += [(n + "_win", f + ["--attn", "window"], ps) for n, f, ps in list(cfgs)]
     return cfgs
 
 
@@ -293,6 +296,8 @@ def main(argv=None):
     p.add_argument("--freq_lambdas", default="",
                    help="comma-separated frequency-loss weights, e.g. 0.01,0.05,0.1: also run every config "
                         "with L1 + lambda * FFT-L1 (named <config>_fl<lambda>)")
+    p.add_argument("--window", action="store_true",
+                   help="also run every config with spatial window attention (--attn window), named <config>_win")
     p.add_argument("--only", default="lowpass,dwt_c3_gr1_skipnorm,dwt_c1_gr1_norm,dwt_cband_gr1_skipnorm",
                    help="comma-separated config names (default: the four 1000-epoch comparison configs; "
                         "--only '' runs every config)")
@@ -332,7 +337,7 @@ def main(argv=None):
         p.error("--freq_lambdas must be comma-separated numbers, got {!r}".format(a.freq_lambdas))
     if any(l <= 0 for l in lambdas):
         p.error("--freq_lambdas values must be > 0 (lambda 0 is the plain-L1 config, always run)")
-    cfgs = build_configs(PATCH_SIZES if a.patch_size == "both" else (int(a.patch_size),), tweaks, lambdas)
+    cfgs = build_configs(PATCH_SIZES if a.patch_size == "both" else (int(a.patch_size),), tweaks, lambdas, a.window)
     if a.scale not in (2, 3, 4) or any(ps % a.scale for _, _, ps in cfgs):
         p.error("patch size must be divisible by --scale")
     if a.only:
@@ -342,7 +347,7 @@ def main(argv=None):
             p.error("unknown config(s): {}; choose from {}".format(sorted(unknown), [n for n, _, _ in cfgs]))
         # A selected config also keeps its --freq_lambdas copies (<name>_fl<lambda>), so the
         # default --only list still runs the loss sweep; an explicit `_fl` name works as well.
-        cfgs = [c for c in cfgs if c[0] in want or re.sub(r"_fl[\d.e+-]+$", "", c[0]) in want]
+        cfgs = [c for c in cfgs if c[0] in want or re.sub(r"_fl[\d.e+-]+$", "", c[0]) in want]  # (_win copies: name them)
 
     a.run_id = a.run_id or new_run_id()
     if a.dry_run:

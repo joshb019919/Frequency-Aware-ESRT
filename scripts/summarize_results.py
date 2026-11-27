@@ -39,11 +39,17 @@ def collect(root, scale):
 
 
 def order(cfg):
-    """bilinear, bicubic, lowpass, lowpass_fl*, then dwt configs each followed by their _fl copies."""
+    """bilinear, bicubic, lowpass, lowpass_fl*, then dwt configs each followed by their _fl copies;
+    a _win (window attention) config comes right after the same config without it."""
     if cfg in BASELINES:
-        return (0, BASELINES.index(cfg), "", -1.0)
-    base, _, lam = cfg.partition("_fl")
-    return (1 if base == "lowpass" else 2, 0, base, float(lam) if lam else -1.0)
+        return (0, BASELINES.index(cfg), "", -1.0, 0)
+    win = cfg.endswith("_win")
+    base, _, lam = (cfg[:-4] if win else cfg).partition("_fl")
+    try:
+        lam = float(lam) if lam else -1.0
+    except ValueError:  # an unexpected name: sort it at the end of its group
+        lam = float("inf")
+    return (1 if base == "lowpass" else 2, 0, base, lam, int(win))
 
 
 def main():

@@ -8,6 +8,7 @@ Produces everything still missing for the report, next to the DWT results alread
 | `baselines` | bilinear + bicubic on all sets; Set14 tests of the 4 committed models; data check | B1, B2 | minutes |
 | `sweep` | `lowpass` + FFT loss, λ = 0.01 / 0.05 / 0.1 | V1 + λ study | ~7 h per config |
 | `dwt` | the 3 DWT configs + FFT loss at the best λ | V3 | ~7 h per config |
+| `window` | best DWT config + FFT loss + **window attention**, and `lowpass_win` (window attention alone) | V4 (stretch) | ~7 h, both in parallel |
 
 Training uses the same settings as the DWT runs (×2, patch 96, 1000 epochs, seed 1, batch 16, `--fast`, bf16). Only the loss changes:
 
@@ -67,6 +68,21 @@ Pick the λ with the best PSNR in the printed table (look at all test sets, not 
 LAMBDA=0.05 scripts/run_fft_experiments.sh dwt
 ```
 
+Stretch goal V4: pick the best DWT config from the `dwt` results, then:
+
+```bash
+LAMBDA=0.05 DWT_CONFIG=dwt_c3_gr1_skipnorm scripts/run_fft_experiments.sh window
+```
+
+This trains `<DWT_CONFIG>_fl<λ>_win` (V4) and `lowpass_win`, one per GPU. `lowpass_win` changes only the attention, so it separates the window effect from the DWT and FFT changes. The two configs don't depend on each other: `lowpass_win` can start as soon as a GPU is free (e.g. `GPUS=1`), even while other phases run.
+
+**What window attention changes** (`--attn window`, `util/transformer.WindowAttention`):
+- **Square windows instead of strips.** ESRT's feature split groups the tokens into 4 horizontal strips, so a token never sees its vertical neighbours in another strip. Here tokens attend inside 24 × 24 spatial windows, Swin-style.
+- **Shift inside the single block.** ESRT has only one transformer block, so instead of alternating blocks, half the heads use windows shifted by 12, which links neighbouring windows.
+- **Masking and position bias.** Odd image sizes are handled by masking padded tokens, and there is a learned relative-position bias.
+- **Same layers and the same training cost.** On a 48 × 48 patch that's 4 groups of 576 tokens, like the strips. The only extra parameters are the 17,672 of the position bias, about 2.6 %.
+- **Cheaper at test time.** The cost is linear in image size, while ESRT's strips grow with the image.
+
 - **Preview first:** `DRY_RUN=1 scripts/run_fft_experiments.sh <phase>` prints every command and the GPU assignment without running anything.
 - **Progress:** `tail -f experiment/run_fft_gpu*/worker.log` (per config: `experiment/run_fft_gpu<N>/exp_<config>/train.log`).
 - **GPUs:** detected automatically. Use `GPUS=1` for one specific GPU, or `GPUS=0,1,2,3` for a list. Each GPU gets its own run folder `experiment/run_fft_gpu<N>/`, so parallel workers never share files.
@@ -102,6 +118,7 @@ In each test folder:
 `experiment/`, `results/`, `downloads/` and the dataset folders' contents are git-ignored, so intermediate checkpoints, SR images and datasets stay on the server.
 
 ## Reporting notes
+- Proposal table rows: B1/B2 = `bilinear`/`bicubic`, V0 = `lowpass`, V1 = `lowpass_fl<λ>`, V2 = `dwt_*`, V3 = `dwt_*_fl<λ>`, V4 = `<DWT_CONFIG>_fl<λ>_win`. The `lowpass_win` ablation is extra.
 - Bicubic reproduces the literature values here: Set5 33.64 dB (paper 33.66), Set14 30.31 (30.24), BSDS300 test 29.55 (BSD100: 29.56). This is the proposal's sanity check.
 - Set5 and Set14 are also the validation sets during training. Checkpoints are never selected by validation score (always epoch 1000), so testing on them is fine, but mention it.
 - The DWT differences are 0.01–0.04 dB from a single seed, below the `--fast`/bf16 effect (0.02–0.1 dB, see COMMANDS.md). Treat FFT gains the same way. If they are this small, call them "no measurable difference".
