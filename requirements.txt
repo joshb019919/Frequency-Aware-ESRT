@@ -1,0 +1,15 @@
+# Install PyTorch first, built for the server's CUDA version (see https://pytorch.org/get-started/locally/), e.g.
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+# then:  pip install -r requirements.txt
+numpy
+scipy
+scikit-image>=0.19
+opencv-python-headless
+Pillow
+matplotlib
+PyWavelets
+thop
+lpips
+DISTS_pytorch
+huggingface_hub
+pytest
