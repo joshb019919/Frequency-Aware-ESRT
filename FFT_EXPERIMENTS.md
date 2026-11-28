@@ -8,7 +8,7 @@ Produces everything still missing for the report, next to the DWT results alread
 | `baselines` | bilinear + bicubic on all sets; Set14 tests of the 4 committed models; data check | B1, B2 | minutes |
 | `sweep` | `lowpass` + FFT loss, λ = 0.01 / 0.05 / 0.1 | V1 + λ study | ~7 h per config |
 | `dwt` | the 3 DWT configs + FFT loss at the best λ | V3 | ~7 h per config |
-| `window` | best DWT config + FFT loss + **window attention**, and `lowpass_win` (window attention alone) | V4 (stretch) | ~7 h, both in parallel |
+| `run_window_experiments.sh` | `lowpass_win` (window attention alone), and best DWT config + FFT loss + **window attention** | V4 (stretch) | ~7 h, both in parallel |
 
 Training uses the same settings as the DWT runs (×2, patch 96, 1000 epochs, seed 1, batch 16, `--fast`, bf16). Only the loss changes:
 
@@ -68,13 +68,16 @@ Pick the λ with the best PSNR in the printed table (look at all test sets, not 
 LAMBDA=0.05 scripts/run_fft_experiments.sh dwt
 ```
 
-Stretch goal V4: pick the best DWT config from the `dwt` results, then:
+Stretch goal V4 has its own script, `scripts/run_window_experiments.sh`, with its own run folders (`experiment/run_window_gpu<N>/`). It can run at the same time as the FFT phases on a free GPU and never shares files with them.
 
 ```bash
-LAMBDA=0.05 DWT_CONFIG=dwt_c3_gr1_skipnorm scripts/run_fft_experiments.sh window
+scripts/run_window_experiments.sh                       # lowpass_win only: needs no λ / DWT choice
+LAMBDA=0.05 DWT_CONFIG=dwt_c3_gr1_skipnorm scripts/run_window_experiments.sh   # + V4 (after the dwt phase)
 ```
 
-This trains `<DWT_CONFIG>_fl<λ>_win` (V4) and `lowpass_win`, one per GPU. `lowpass_win` changes only the attention, so it separates the window effect from the DWT and FFT changes. The two configs don't depend on each other: `lowpass_win` can start as soon as a GPU is free (e.g. `GPUS=1`), even while other phases run.
+- **`lowpass_win`** changes only the attention, so it separates the window effect from the DWT and FFT changes.
+- **`<DWT_CONFIG>_fl<λ>_win`** is V4: the best DWT config + FFT loss + window attention.
+- **GPUs:** with both set, the two train one per GPU. Add `GPUS=1` to use a single free GPU.
 
 **What window attention changes** (`--attn window`, `util/transformer.WindowAttention`):
 - **Square windows instead of strips.** ESRT's feature split groups the tokens into 4 horizontal strips, so a token never sees its vertical neighbours in another strip. Here tokens attend inside 24 × 24 spatial windows, Swin-style.
@@ -83,8 +86,8 @@ This trains `<DWT_CONFIG>_fl<λ>_win` (V4) and `lowpass_win`, one per GPU. `lowp
 - **Same layers and the same training cost.** On a 48 × 48 patch that's 4 groups of 576 tokens, like the strips. The only extra parameters are the 17,672 of the position bias, about 2.6 %.
 - **Cheaper at test time.** The cost is linear in image size, while ESRT's strips grow with the image.
 
-- **Preview first:** `DRY_RUN=1 scripts/run_fft_experiments.sh <phase>` prints every command and the GPU assignment without running anything.
-- **Progress:** `tail -f experiment/run_fft_gpu*/worker.log` (per config: `experiment/run_fft_gpu<N>/exp_<config>/train.log`).
+- **Preview first:** `DRY_RUN=1 scripts/run_fft_experiments.sh <phase>` (or `DRY_RUN=1 scripts/run_window_experiments.sh`) prints every command and the GPU assignment without running anything.
+- **Progress:** `tail -F experiment/run_fft_gpu*/worker.log` (window runs: `experiment/run_window_gpu*/worker.log`) (per config: `experiment/run_fft_gpu<N>/exp_<config>/train.log`).
 - **GPUs:** detected automatically. Use `GPUS=1` for one specific GPU, or `GPUS=0,1,2,3` for a list. Each GPU gets its own run folder `experiment/run_fft_gpu<N>/`, so parallel workers never share files.
 - **Resume:** run the same command again. Finished configs are skipped, interrupted ones restart, and this works even with a different number of GPUs.
 
