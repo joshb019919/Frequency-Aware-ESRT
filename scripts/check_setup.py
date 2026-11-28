@@ -1,4 +1,4 @@
-"""Preflight for the FFT experiments on a GPU server: run this before scripts/run_fft_experiments.sh.
+"""Preflight for the experiments on a GPU server: run this before the scripts/run_*.sh scripts.
 
 Checks CUDA, the Python packages, the DIV2K training data, the benchmark sets (with the image counts
 the DWT results were produced with) and the lowpass baseline in final_results/. Prints one line per

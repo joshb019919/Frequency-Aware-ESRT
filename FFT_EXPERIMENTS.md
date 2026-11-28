@@ -1,39 +1,42 @@
 # Report experiments on a GPU server: runbook
 
-Produces everything still missing for the report, next to the DWT results already in `final_results/`.
+One script per experiment. Each one trains exactly its configs, tests them on Set5 / Set14 / BSDS300 / Manga109, copies everything to `final_results/<config>/` (with a `run_info.json` saying how it was made) and prints the results table. Run them from the `Frequency-Aware-ESRT` folder, inside `tmux`.
 
-| Phase | What | Proposal | Time |
-|---|---|---|---|
-| — | `lowpass` + 3 DWT configs (Set5, BSDS300, Manga109) | V0, V2 | done, in `final_results/` |
-| `baselines` | bilinear + bicubic on all sets; Set14 tests of the 4 committed models; data check | B1, B2 | minutes |
-| `sweep` | `lowpass` + FFT loss, λ = 0.01 / 0.05 / 0.1 | V1 + λ study | ~7 h per config |
-| `dwt` | the 3 DWT configs + FFT loss at the best λ | V3 | ~7 h per config |
-| `run_window_experiments.sh` | window attention alone, + DWT, + FFT, + DWT + FFT (V4): the full window ablation | V4 (stretch) | ~7 h per config |
+| Script | Experiment | Proposal | Configs | Time |
+|---|---|---|---|---|
+| `scripts/run_baselines.sh` | bilinear, bicubic; Set14 tests of the committed models | B1, B2 | – | minutes (done) |
+| `scripts/run_fft.sh` | FFT loss, λ = 0.01 / 0.05 / 0.1 | V1 + λ study | `lowpass_fl<λ>` | ~7 h each |
+| `scripts/run_dwt_fft.sh` | DWT + FFT, best λ | V3 | `dwt_*_fl<λ>` (3 variants) | ~7 h each |
+| `scripts/run_window.sh` | window attention | – | `lowpass_win` | ~7 h |
+| `scripts/run_dwt_window.sh` | DWT + window | – | `dwt_cband_gr1_skipnorm_win` | ~7 h |
+| `scripts/run_fft_window.sh` | FFT + window, best λ | – | `lowpass_fl<λ>_win` | ~7 h |
+| `scripts/run_dwt_fft_window.sh` | DWT + FFT + window, best λ | V4 | `dwt_cband_gr1_skipnorm_fl<λ>_win` | ~7 h |
 
-Training uses the same settings as the DWT runs (×2, patch 96, 1000 epochs, seed 1, batch 16, `--fast`, bf16). Only the loss changes:
+Already in `final_results/`: `lowpass` (V0) and the three DWT variants (V2).
 
-L = ‖SR − HR‖₁ + λ · ‖FFT(SR) − FFT(HR)‖₁
+- **λ:** the scripts with "best λ" read it from the finished FFT sweep, picking the λ with the best mean PSNR gain over lowpass. Until the sweep has finished, they stop with a message.
+- **Settings:** the choices are set once, at the top of `scripts/lib_experiments.sh`: `DEFAULT_GPUS=1` (`0,1` = both GPUs), `DEFAULT_DWT_CONFIG=dwt_cband_gr1_skipnorm` and `SWEEP_LAMBDAS=0.01,0.05,0.1`.
+- **Safe to re-run:** finished configs are skipped and configs still training are not started twice. A script that was interrupted continues where it stopped; a config cut off mid-training restarts from epoch 1.
+- **One at a time on one GPU:** start the next script when the previous one prints its table. With `DEFAULT_GPUS=0,1`, a script with several configs trains them in parallel.
+- **Preview:** `DRY_RUN=1 scripts/<script>.sh` prints what it would run, without running it.
+- **Progress:** `tail -F experiment/*_gpu*/worker.log`. Each script's run folder is `experiment/run_<name>_gpu<N>/`.
 
-Configs train **one per GPU in parallel**. GPUs are detected automatically, so two GPUs make each phase about 14 h. All commands run from the repo root.
-
-
-## Quick start (after setup)
+## Order on the server
 
 ```bash
 cd ~/Frequency-Aware-ESRT && source .venv/bin/activate && git pull
-scripts/run_fft_experiments.sh sweep        # FFT loss, λ = 0.01 / 0.05 / 0.1
-scripts/run_fft_experiments.sh dwt          # DWT + FFT, best λ of the sweep picked automatically
-scripts/run_window_experiments.sh           # every window combination that can run yet (run again after the sweep)
+scripts/run_dwt_window.sh          # needs no λ: can run while the FFT sweep is still going
+# ... after the FFT sweep has finished:
+scripts/run_dwt_fft.sh
+scripts/run_fft_window.sh
+scripts/run_dwt_fft_window.sh
 ```
 
-These need no settings. The choices are fixed once at the top of `scripts/lib_experiments.sh`:
-- `DEFAULT_GPUS=1` (GPU 1; `0,1` uses both)
-- `DEFAULT_DWT_CONFIG=dwt_cband_gr1_skipnorm`
-- `SWEEP_LAMBDAS=0.01,0.05,0.1`
+The FFT sweep and `lowpass_win` are already running from the older scripts, which is fine: the new scripts recognise their results. While that sweep is running, **don't start `scripts/run_fft.sh`**, because it would train λ = 0.1 a second time. Run it once after the sweep has finished: it only adds `run_info.json` to the λ results.
 
-Every command can be re-run at any time: finished configs are skipped, and configs still training are not started twice. `LAMBDA=`, `DWT_CONFIG=`, `GPUS=` and `CONFIGS=` still override the defaults for one run.
+## Setup (once)
 
-## 1. Clone and create the venv
+### Clone and create the venv
 
 ```bash
 git clone -b dev/fft https://github.com/joshb019919/Frequency-Aware-ESRT.git
@@ -48,7 +51,7 @@ python -c "import torch; print(torch.cuda.is_available(), torch.cuda.device_coun
 
 Run `source .venv/bin/activate` in every new terminal or tmux window. The scripts also use `.venv/bin/python` on their own; set `PY=/path/to/python` to override.
 
-## 2. Download the data (first time only, re-runnable)
+### Download the data (first time only, re-runnable)
 
 Run every command from the `Frequency-Aware-ESRT` folder. All data goes into folders **inside the repo**, so no special permissions are needed. Those folders are already in the clone (empty, with a `.gitkeep`) and git-ignored, so the data is never committed. You need about 20 GB free.
 
@@ -66,68 +69,13 @@ scripts/download_data.sh
 
 These are the paths `train.py`, `test.py` and `experiments.py` already look for (relative to the repo), so no path flags are needed anywhere. The script ends with `scripts/check_setup.py`; everything except Manga109 should be `ok`. Without Manga109, the Manga109 column shows `-` and the rest still runs.
 
-If the data already lives somewhere else, `ROOT=/path/div2k BENCH=/path scripts/run_fft_experiments.sh ...` links those benchmark folders into the repo, where training validation needs them.
+If the data already lives somewhere else, `ROOT=/path/div2k BENCH=/path scripts/run_<name>.sh` links those benchmark folders into the repo, where training validation needs them.
 
-## 3. Run
 
-Use `tmux`, because the training phases run for hours:
-
-```bash
-tmux new -s report
-source .venv/bin/activate
-scripts/run_fft_experiments.sh baselines      # minutes: B1/B2, Set14 tests, data check
-scripts/run_fft_experiments.sh sweep          # V1: lowpass with λ = 0.01, 0.05, 0.1
-```
-
-Pick the λ with the best PSNR in the printed table (look at all test sets, not only Set5), then:
-
-```bash
-LAMBDA=0.05 scripts/run_fft_experiments.sh dwt
-```
-
-Stretch goal V4 has its own script, `scripts/run_window_experiments.sh`, with its own run folders (`experiment/run_window_gpu<N>/`). It can run at the same time as the FFT phases on a free GPU and never shares files with them.
-
-It builds its configs from whatever you have decided so far:
-
-| Set | Adds | Combination |
-|---|---|---|
-| nothing | `lowpass_win` | window |
-| `DWT_CONFIG=<dwt>` | `<dwt>_win` | DWT + window |
-| `LAMBDA=<λ>` | `lowpass_fl<λ>_win` | FFT + window |
-| both | `<dwt>_fl<λ>_win` | DWT + FFT + window (**V4**) |
-
-```bash
-scripts/run_window_experiments.sh                                                  # window only
-LAMBDA=0.05 DWT_CONFIG=dwt_c3_gr1_skipnorm scripts/run_window_experiments.sh       # all four window rows
-GPUS=1 DWT_CONFIG=dwt_cband_gr1_skipnorm CONFIGS=dwt_cband_gr1_skipnorm_win scripts/run_window_experiments.sh
-                                                                                   # one named config on GPU 1
-```
-
-- **Finished configs are skipped,** so running again with more set only trains what's new.
-- **A config still training doesn't count as finished,** because it has no final checkpoint yet. While one is running, use `CONFIGS=` to start others without retraining it.
-- **Together with the FFT phases,** this covers all 8 combinations of DWT, FFT and window attention.
-
-**What window attention changes** (`--attn window`, `util/transformer.WindowAttention`):
-- **Square windows instead of strips.** ESRT's feature split groups the tokens into 4 horizontal strips, so a token never sees its vertical neighbours in another strip. Here tokens attend inside 24 × 24 spatial windows, Swin-style.
-- **Shift inside the single block.** ESRT has only one transformer block, so instead of alternating blocks, half the heads use windows shifted by 12, which links neighbouring windows.
-- **Masking and position bias.** Odd image sizes are handled by masking padded tokens, and there is a learned relative-position bias.
-- **Same layers and the same training cost.** On a 48 × 48 patch that's 4 groups of 576 tokens, like the strips. The only extra parameters are the 17,672 of the position bias, about 2.6 %.
-- **Cheaper at test time.** The cost is linear in image size, while ESRT's strips grow with the image.
-
-- **Preview first:** `DRY_RUN=1 scripts/run_fft_experiments.sh <phase>` (or `DRY_RUN=1 scripts/run_window_experiments.sh`) prints every command and the GPU assignment without running anything.
-- **Progress:** `tail -F experiment/run_fft_gpu*/worker.log` (window runs: `experiment/run_window_gpu*/worker.log`) (per config: `experiment/run_fft_gpu<N>/exp_<config>/train.log`).
-- **GPUs:** detected automatically. Use `GPUS=1` for one specific GPU, or `GPUS=0,1,2,3` for a list. Each GPU gets its own run folder `experiment/run_fft_gpu<N>/`, so parallel workers never share files.
-- **Resume:** run the same command again. Finished configs are skipped, interrupted ones restart, and this works even with a different number of GPUs.
-
-**About the data check** (in `baselines`): it re-tests the committed `lowpass` checkpoint on this machine's data, in both `--fast` and `--no-fast` mode, and compares every image with the committed numbers.
-- On a match, it records the mode and the later phases test the same way, so the new rows are directly comparable with the DWT rows.
-- On a mismatch, it prints a warning. Usually this means different benchmark files; then re-test the committed models here before comparing.
-
-## 4. Save and push the results
+## Save and push the results
 
 ```bash
 .venv/bin/python scripts/summarize_results.py --csv final_results/summary.csv
-cp experiment/experiments_run_fft_gpu*.csv final_results/ 2>/dev/null || true
 git add final_results
 git commit -m "Add baseline, Set14 and FFT-loss results"
 git push origin dev/fft
@@ -148,9 +96,18 @@ In each test folder:
 
 `experiment/`, `results/`, `downloads/` and the dataset folders' contents are git-ignored, so intermediate checkpoints, SR images and datasets stay on the server.
 
+
+## What the changes are
+
+- **FFT loss** (`--freq_loss_lambda`, `losses.py`): L = ‖SR − HR‖₁ + λ · ‖FFT(SR) − FFT(HR)‖₁, with an orthonormal FFT over real and imaginary parts, computed on RGB.
+- **DWT** (`--freq dwt`, `model/dwt.py`): Haar wavelet split in the high-frequency module, from Josh's experiments.
+- **Window attention** (`--attn window`, `util/transformer.WindowAttention`): tokens attend inside 24 × 24 spatial windows instead of ESRT's 4 horizontal strips.
+  - Half the heads use windows shifted by 12, since ESRT has only one transformer block.
+  - It uses the same layers as before, plus a relative-position bias (+17,672 params, about 2.6 %).
+  - Training cost is the same, and it is cheaper on large test images.
+
 ## Reporting notes
-- Proposal table rows: B1/B2 = `bilinear`/`bicubic`, V0 = `lowpass`, V1 = `lowpass_fl<λ>`, V2 = `dwt_*`, V3 = `dwt_*_fl<λ>`, V4 = `<DWT_CONFIG>_fl<λ>_win`. The `lowpass_win` ablation is extra.
-- Bicubic reproduces the literature values here: Set5 33.64 dB (paper 33.66), Set14 30.31 (30.24), BSDS300 test 29.55 (BSD100: 29.56). This is the proposal's sanity check.
+- Proposal rows: B1/B2 = `bilinear`/`bicubic`, V0 = `lowpass`, V1 = `lowpass_fl<λ>`, V2 = `dwt_*`, V3 = `dwt_*_fl<λ>`, V4 = `dwt_cband_gr1_skipnorm_fl<λ>_win`. The other window rows complete the DWT × FFT × window ablation.
+- Bicubic reproduces the literature values here: Set5 33.64 dB (paper 33.66), Set14 30.31 (30.24), BSDS300 test 29.55 (BSD100: 29.56).
 - Set5 and Set14 are also the validation sets during training. Checkpoints are never selected by validation score (always epoch 1000), so testing on them is fine, but mention it.
-- The DWT differences are 0.01–0.04 dB from a single seed, below the `--fast`/bf16 effect (0.02–0.1 dB, see COMMANDS.md). Treat FFT gains the same way. If they are this small, call them "no measurable difference".
-- The loss is computed on RGB because the model is RGB-only. PSNR/SSIM are on Y, like everything else.
+- The DWT differences are 0.01–0.04 dB from a single seed, below the `--fast`/bf16 effect (0.02–0.1 dB). Judge every other change the same way; differences this small are "no measurable difference".

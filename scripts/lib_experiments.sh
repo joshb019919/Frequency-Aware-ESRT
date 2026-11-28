@@ -1,4 +1,4 @@
-# Shared helpers for scripts/run_fft_experiments.sh and scripts/run_window_experiments.sh (sourced, not run).
+# Shared helpers for the scripts/run_*.sh experiment scripts (sourced, not run).
 #
 # Provides: defaults from the environment, GPU detection, train_parallel (one experiments.py per GPU),
 # test_and_package (Set14/BSDS300/Manga109 tests + copy to final_results/<config>/), test_one, summarize.
@@ -48,7 +48,7 @@ if [ -z "${GPUS:-}" ]; then
 fi
 SCALE=2
 DRY_RUN=${DRY_RUN:-0}
-MODE_FILE=experiment/run_fft/test_mode   # written by `run_fft_experiments.sh baselines` (data check)
+MODE_FILE=experiment/run_fft/test_mode   # written by scripts/run_baselines.sh (data check)
 if [ -z "${TEST_FAST:-}" ]; then
   if [ -f "$MODE_FILE" ]; then TEST_FAST=$(cat "$MODE_FILE"); else TEST_FAST=--fast; fi
 fi
@@ -107,9 +107,9 @@ seed_reference() {  # seed_reference RUN_ID: finished lowpass run -> that run fo
   done
 }
 
-find_exp() {  # find_exp NAME: the worker run folder (of this $RUN) holding NAME's final checkpoint, or empty
+find_exp() {  # find_exp NAME: a run folder (of any experiment script) holding NAME's final checkpoint, or empty
   local d
-  for d in experiment/"$RUN"_gpu*/exp_"$1"; do
+  for d in experiment/*_gpu*/exp_"$1"; do
     if [ -f "$d/epoch_$EPOCHS.pth" ]; then echo "$d"; return 0; fi
   done
   return 0
@@ -260,6 +260,29 @@ info = {
 }
 json.dump(info, open(os.path.join(e["OUT"], "run_info.json"), "w"), indent=2)
 PYEOF
+}
+
+# run_configs NAME...: train (skipping finished / still-training ones), test and package exactly these configs,
+# then print the results table. The experiments.py options are derived from the names (_fl<l>, _win).
+run_configs() {
+  NAMES=("$@")
+  local n lams="" win=()
+  for n in "${NAMES[@]}"; do
+    if [[ $n =~ _fl([0-9.e+-]+)(_win)?$ ]]; then lams="${lams:+$lams,}${BASH_REMATCH[1]}"; fi
+    if [ "${n%_win}" != "$n" ]; then win=(--window); fi
+  done
+  echo "configs: ${NAMES[*]}"
+  train_parallel ${lams:+--freq_lambdas "$lams"} ${win[@]+"${win[@]}"}
+  test_and_package
+  summarize
+}
+
+need_lambda() {  # prints the sweep's best lambda, or stops with a clear message if the sweep is not done yet
+  local l
+  l=$(best_lambda)
+  [ -n "$l" ] || { echo "The FFT sweep (scripts/run_fft.sh) has not finished yet, so there is no best lambda." >&2
+                   echo "Run this again once it has finished." >&2; exit 1; }
+  echo "$l"
 }
 
 summarize() {
