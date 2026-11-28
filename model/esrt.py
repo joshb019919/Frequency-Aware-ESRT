@@ -29,14 +29,55 @@ from util.transformer import drop_path, DropPath, PatchEmbed, Mlp,MLABlock
 from util.position import PositionEmbeddingLearned, PositionEmbeddingSine
 import pdb
 import math
+from model import dwt
 
-def make_model(upscale=4):
+FREQ_CHOICES = ('lowpass', 'dwt')
+CONV_CHOICES = (1, 3, 'band')
+
+
+def add_model_args(parser):
+    """Add the frequency-split flags (--freq, --conv, --global_res) to an argparse parser."""
+    parser.add_argument('--freq', choices=FREQ_CHOICES, default='lowpass',
+                        help='Updownblock band split: lowpass (original) or Haar dwt')
+    parser.add_argument('--conv', choices=['1', '3', 'band'], default=None,
+                        help='dwt high path: 1 = 1x1 conv 3C->C, 3 = 3x3 conv 3C->C, '
+                             'band = shared decoder_high per band (default 1; needs --freq dwt)')
+    parser.add_argument('--global_res', type=int, choices=[0, 1], default=1,
+                        help='1 = keep the global skip in ESRT (default); 0 = remove it (needs --freq dwt)')
+    parser.add_argument('--dwt_skip', type=int, choices=[0, 1], default=0,
+                        help='1 = residual around the dwt high path (bands + expand(...), expand zero-init); '
+                             'affects --conv 1/3 only (needs --freq dwt)')
+    parser.add_argument('--ll_norm', type=int, choices=[0, 1], default=0,
+                        help='1 = decoder_low sees LL/2 (= average-pool scale), rescaled x2 before IDWT '
+                             '(needs --freq dwt)')
+
+
+def model_kwargs(args):
+    """ESRT keyword arguments from parsed args (empty for the default lowpass model)."""
+    kw = {}
+    if (args.freq != 'lowpass' or args.conv is not None or args.global_res != 1
+            or args.dwt_skip or args.ll_norm):
+        kw = dict(freq=args.freq, dwt_conv=args.conv, global_res=bool(args.global_res),
+                  dwt_skip=bool(args.dwt_skip), ll_norm=bool(args.ll_norm))
+    return kw
+
+
+def variant_tag(args):
+    """Folder suffix identifying the flag combination ('' for the default model)."""
+    if args.freq == 'lowpass':
+        return ''
+    return '_dwt_c{}_gr{}{}{}'.format(args.conv or 1, args.global_res,
+                                      '_sk' if args.dwt_skip else '', '_nm' if args.ll_norm else '')
+
+
+def make_model(upscale=4, freq='lowpass', dwt_conv=None, global_res=True, dwt_skip=False, ll_norm=False):
     """Factory returning an ESRT model for the given upscale factor."""
     # inpu = torch.randn(1, 3, 320, 180).cpu()
     # flops, params = profile(RTC(upscale).cpu(), inputs=(inpu,))
     # print(params)
     # print(flops)
-    return ESRT(upscale=upscale)
+    return ESRT(upscale=upscale, freq=freq, dwt_conv=dwt_conv, global_res=global_res,
+                dwt_skip=dwt_skip, ll_norm=ll_norm)
 
 
 ## Channel Attention (CA) Layer
@@ -159,23 +200,71 @@ class Updownblock(nn.Module):
     bands are recombined (concat -> 1x1 conv -> channel attention -> refine),
     and a skip connection from the block input is added.
     """
-    def __init__(self, n_feats):
+    def __init__(self, n_feats, freq='lowpass', dwt_conv=1, dwt_skip=False, ll_norm=False):
         super(Updownblock, self).__init__()
+        self.freq = freq
+        self.dwt_conv = dwt_conv
+        self.dwt_skip = dwt_skip
+        self.ll_norm = ll_norm
         self.encoder = one_module(n_feats)
         self.decoder_low = one_module(n_feats) #nn.Sequential(one_module(n_feats),
         #                     one_module(n_feats),
         #                     one_module(n_feats))
         self.decoder_high = one_module(n_feats)
         self.alise = one_module(n_feats)
-        self.alise2 = BasicConv(2*n_feats, n_feats, 1,1,0) #one_module(n_feats)
+        if freq == 'lowpass':
+            self.alise2 = BasicConv(2*n_feats, n_feats, 1,1,0) #one_module(n_feats)
+        elif dwt_conv in (1, 3):
+            # Detail bands are signed, so no ReLU on these projections.
+            k = 1 if dwt_conv == 1 else 3
+            self.high_reduce = BasicConv(3*n_feats, n_feats, k, 1, k//2, relu=False)
+            self.high_expand = BasicConv(n_feats, 3*n_feats, 1, 1, 0, relu=False)
+            if dwt_skip:  # start as an exact pass-through of the detail bands
+                nn.init.zeros_(self.high_expand.conv.weight)
         self.down = nn.AvgPool2d(kernel_size=2)
         self.att = CALayer(n_feats)
 
-    def forward(self, x):
+    def split_bands(self, feat, size):
+        """Split `feat` into (low, high) frequency bands.
+
+        low: 2x average-pooled features (half resolution).
+        high: `feat` minus `low` bilinearly upsampled to `size` (full resolution).
+        """
+        low = self.down(feat)
+        high = feat - F.interpolate(low, size=size, mode='bilinear', align_corners=True)
+        return low, high
+
+    def _forward_dwt(self, x):
+        """Haar variant: DWT -> low path on LL, high path on LH/HL/HH -> exact IDWT."""
         x1 = self.encoder(x)
-        x2 = self.down(x1)  # low-frequency branch at half resolution
-        # High-frequency detail = features minus their blurred (down/up-sampled) version.
-        high = x1 - F.interpolate(x2, size = x.size()[-2:], mode='bilinear', align_corners=True)
+        xp, (h, w) = dwt.pad_even(x1)
+        ll, lh, hl, hh = dwt.haar_dwt2(xp.float())  # Haar math stays fp32 even under autocast
+        if self.ll_norm:
+            ll = ll * 0.5  # orthonormal LL is 2x the average pool; match the lowpass input scale
+        for i in range(5):
+            ll = self.decoder_low(ll)
+        if self.ll_norm:
+            ll = ll * 2
+        if self.dwt_conv == 'band':
+            b = ll.shape[0]
+            out = self.decoder_high(torch.cat([lh, hl, hh], dim=0))
+            lh, hl, hh = out[:b], out[b:2*b], out[2*b:]
+        else:
+            high = self.decoder_high(self.high_reduce(torch.cat([lh, hl, hh], dim=1)))
+            d_lh, d_hl, d_hh = torch.chunk(self.high_expand(high), 3, dim=1)
+            if self.dwt_skip:  # residual around the 3C->C bottleneck
+                lh, hl, hh = lh + d_lh, hl + d_hl, hh + d_hh
+            else:
+                lh, hl, hh = d_lh, d_hl, d_hh
+        y = dwt.haar_idwt2(ll.float(), lh.float(), hl.float(), hh.float())[..., :h, :w]
+        return self.alise(self.att(y)) + x
+
+    def forward(self, x):
+        if self.freq == 'dwt':
+            return self._forward_dwt(x)
+        x1 = self.encoder(x)
+        # x2: low-frequency branch at half resolution; high: full-res detail residual.
+        x2, high = self.split_bands(x1, x.size()[-2:])
         # The same decoder_low block (shared weights) is applied 5 times.
         for i in range(5):
             x2 = self.decoder_low(x2)
@@ -197,11 +286,11 @@ class Un(nn.Module):
     The attention dim=288 equals n_feats(32) * 3 * 3, i.e. one flattened 3x3
     patch per token, so it is tied to n_feats=32.
     """
-    def __init__(self,n_feats, wn):
+    def __init__(self,n_feats, wn, freq='lowpass', dwt_conv=1, dwt_skip=False, ll_norm=False):
         super(Un, self).__init__()
-        self.encoder1 = Updownblock(n_feats)
-        self.encoder2 = Updownblock(n_feats)
-        self.encoder3 = Updownblock(n_feats)
+        self.encoder1 = Updownblock(n_feats, freq, dwt_conv, dwt_skip, ll_norm)
+        self.encoder2 = Updownblock(n_feats, freq, dwt_conv, dwt_skip, ll_norm)
+        self.encoder3 = Updownblock(n_feats, freq, dwt_conv, dwt_skip, ll_norm)
         self.reduce = common.default_conv(3*n_feats, n_feats, 3)
         self.weight2 = common.Scale(1)
         self.weight1 = common.Scale(1)
@@ -233,8 +322,23 @@ class ESRT(nn.Module):
     Input: LR RGB image (B, 3, H, W) in [0, 1]. Output: (B, 3, scale*H, scale*W).
     Uses n_feats=32 feature channels and a single `Un` body block.
     """
-    def __init__(self, upscale=4, conv=common.default_conv):
+    def __init__(self, upscale=4, conv=common.default_conv, freq='lowpass', dwt_conv=None, global_res=True,
+                 dwt_skip=False, ll_norm=False):
         super(ESRT, self).__init__()
+        if freq not in FREQ_CHOICES:
+            raise ValueError("freq must be one of {}, got {!r}".format(FREQ_CHOICES, freq))
+        if freq == 'lowpass' and dwt_conv is not None:
+            raise ValueError("--conv is only valid with --freq dwt")
+        if freq == 'lowpass' and not global_res:
+            raise ValueError("--global_res 0 is only valid with --freq dwt")
+        if freq == 'lowpass' and (dwt_skip or ll_norm):
+            raise ValueError("--dwt_skip and --ll_norm are only valid with --freq dwt")
+        if dwt_conv is None:
+            dwt_conv = 1
+        dwt_conv = dwt_conv if dwt_conv == 'band' else int(dwt_conv)
+        if dwt_conv not in CONV_CHOICES:
+            raise ValueError("--conv must be one of {}, got {!r}".format(CONV_CHOICES, dwt_conv))
+        self.global_res = global_res
         wn = lambda x:torch.nn.utils.weight_norm(x)
         n_feats = 32
         n_blocks = 1
@@ -257,7 +361,8 @@ class ESRT(nn.Module):
         modules_body = nn.ModuleList()
         for i in range(n_blocks):
             modules_body.append(
-                Un(n_feats=n_feats, wn = wn))
+                Un(n_feats=n_feats, wn = wn, freq=freq, dwt_conv=dwt_conv,
+                   dwt_skip=dwt_skip, ll_norm=ll_norm))
 
         # define tail module (upsample deep features, project back to RGB)
         modules_tail = [
@@ -267,8 +372,9 @@ class ESRT(nn.Module):
 
 
         # Global skip path: upsample the shallow (head) features straight to RGB.
-        self.up = nn.Sequential(common.Upsampler(conv,scale,n_feats,act=False),
-                          BasicConv(n_feats, 3,3,1,1))
+        if global_res:
+            self.up = nn.Sequential(common.Upsampler(conv,scale,n_feats,act=False),
+                              BasicConv(n_feats, 3,3,1,1))
         self.head = nn.Sequential(*modules_head)
         self.body = nn.Sequential(*modules_body)
         self.tail = nn.Sequential(*modules_tail)
@@ -290,7 +396,8 @@ class ESRT(nn.Module):
 
 
         x1 = self.tail(res1)
-        x1 = self.up(res2) + x1   # add the global skip (long-range residual)
+        if self.global_res:
+            x1 = self.up(res2) + x1   # add the global skip (long-range residual)
         # x1 = self.add_mean(x1)
         #x2 = self.tail(res2)
         return x1

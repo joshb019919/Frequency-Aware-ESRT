@@ -6,7 +6,7 @@ Role in ESRT: the training entry point. It wires together the data pipeline
 Script-style entry point (everything runs inside main(), under an
 `if __name__ == '__main__':` guard so DataLoader worker processes started with
 the 'spawn'/'forkserver' method can re-import this file safely): parses CLI
-args, builds the DIV2K training loader and Set5 validation loader, trains with L1 loss + Adam and a
+args, builds the DIV2K training loader and the validation loaders (--val_sets, default set14+set5), trains with L1 loss + Adam and a
 step-decay LR schedule, validates (Y-channel PSNR/SSIM) every epoch and saves a
 checkpoint every 10 epochs to experiment/checkpoint_ESRT_x<scale>/.
 
@@ -18,7 +18,9 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from model import esrt
-from data import DIV2K, Set5_val
+from data import DIV2K, benchmarks
+import metrics_freq
+import plotting
 import utils
 import skimage.color as sc
 import random
@@ -55,7 +57,21 @@ parser.add_argument("--isY", action="store_true", default=True)  # evaluate PSNR
 parser.add_argument("--ext", type=str, default='.npy')  # training image format: '.npy' (pre-decoded) or '.png'
 parser.add_argument("--phase", type=str, default='train')
 parser.add_argument("--model", type=str, default='ESRT')  # currently unused; ESRT is hard-coded below
-parser.add_argument("--amp", action="store_true", default=False, help="use AMP with fp16 to speed training")
+esrt.add_model_args(parser)  # --freq / --conv / --global_res
+parser.add_argument("--amp", action="store_true", default=True, help="deprecated no-op: bf16 AMP is on by default (CUDA)")
+parser.add_argument("--no_amp", action="store_true", default=False, help="disable bf16 AMP and channels_last (plain fp32 training)")
+parser.add_argument("--val_every", type=int, default=5, help="validate every N epochs (and once after the last epoch)")
+parser.add_argument("--ref_history", type=str, default=None,
+                    help="history.json of a finished run (e.g. lowpass); its final level is drawn as a dashed black line in the curves")
+parser.add_argument("--save_dir", type=str, default=None, help="checkpoint folder (default experiment/checkpoint_ESRT_x<scale>[variant]/)")
+parser.add_argument("--val_sets", type=str, default=benchmarks.DEFAULT_VAL_SETS,
+                    help="comma-separated validation sets, from: " + ",".join(benchmarks.NAMES))
+parser.add_argument("--bench_root", type=str, default=benchmarks.DEFAULT_BENCH_ROOT,
+                    help="directory holding the benchmark datasets (set14, bsds300, ...)")
+parser.add_argument("--plot", action=argparse.BooleanOptionalAction, default=True,
+                    help="write <save_dir>/curves.png (train loss | val PSNR | val SSIM), updated at each validation")
+metrics_freq.add_args(parser)  # --hf_metrics / --perceptual / --wavelets
+utils.add_fast_arg(parser)
 
 def train(epoch, model, optimizer, l1_criterion, training_data_loader, args, device):
     """Run one training epoch over `training_data_loader`.
@@ -66,22 +82,32 @@ def train(epoch, model, optimizer, l1_criterion, training_data_loader, args, dev
     model.train()
     utils.adjust_learning_rate(optimizer, epoch, args.step_size, args.lr, args.gamma)
     print('epoch =', epoch, 'lr = ', optimizer.param_groups[0]['lr'])
+    loss_sum, n_iter = 0.0, 0  # running sum stays on the GPU: no per-iteration sync
     for iteration, (lr_tensor, hr_tensor) in enumerate(training_data_loader, 1):
 
         if args.cuda:
-            lr_tensor = lr_tensor.to(device)  # ranges from [0, 1]
-            hr_tensor = hr_tensor.to(device)  # ranges from [0, 1]
+            lr_tensor = lr_tensor.to(device, non_blocking=True)  # ranges from [0, 1]
+            hr_tensor = hr_tensor.to(device, non_blocking=True)  # ranges from [0, 1]
+            if args.use_amp:
+                lr_tensor = lr_tensor.contiguous(memory_format=torch.channels_last)
 
-        optimizer.zero_grad()
-        sr_tensor = model(lr_tensor)
-        loss_l1 = l1_criterion(sr_tensor, hr_tensor)
+        optimizer.zero_grad(set_to_none=True)
+        with torch.autocast('cuda', dtype=torch.bfloat16, enabled=args.use_amp):
+            sr_tensor = model(lr_tensor)
+        loss_l1 = l1_criterion(sr_tensor.float(), hr_tensor)
         loss_sr = loss_l1
 
         loss_sr.backward()
         optimizer.step()
+        loss_sum += loss_l1.detach()
+        n_iter = iteration
         if iteration % 100 == 0:
             print("===> Epoch[{}]({}/{}): Loss_l1: {:.5f}".format(epoch, iteration, len(training_data_loader),
                                                                   loss_l1.item()))
+    if n_iter:
+        avg = float(loss_sum) / n_iter
+        print("===> Epoch[{}] avg Loss_l1: {:.5f}".format(epoch, avg))
+        return avg
 def forward_chop(model, x, scale, shave=10, min_size=60000):
     """Memory-saving inference: split the LR image into 4 overlapping quadrants.
 
@@ -141,22 +167,22 @@ def forward_chop(model, x, scale, shave=10, min_size=60000):
 
     return output
 
-def valid(scale, model, testing_data_loader, args, device):
-    """Evaluate on the validation set and print mean PSNR / SSIM.
+def evaluate(scale, model, loader, args, device, freq_eval=None, freq_rows=None):
+    """Mean (PSNR, SSIM) of `model` over one validation loader.
 
     Images are super-resolved with forward_chop, shaved by `scale` border
-    pixels, and (if --isY) compared on the quantised Y channel of YCbCr.
+    pixels, and (if --isY) compared on the quantised Y channel of YCbCr. If `freq_eval` (a
+    metrics_freq.FreqEvaluator) is given, its per-image metric dicts are appended to `freq_rows`.
     """
     model.eval()
-
     avg_psnr, avg_ssim = 0, 0
-    for batch in testing_data_loader:
+    for batch in loader:
         lr_tensor, hr_tensor = batch[0], batch[1]
         if args.cuda:
-            lr_tensor = lr_tensor.to(device)
-            hr_tensor = hr_tensor.to(device)
+            lr_tensor = lr_tensor.to(device, non_blocking=True)
+            hr_tensor = hr_tensor.to(device, non_blocking=True)
 
-        with torch.no_grad():
+        with torch.inference_mode():
             pre = forward_chop(model, lr_tensor, scale)#model(lr_tensor)
 
         sr_img = utils.tensor2np(pre.detach()[0])
@@ -170,16 +196,46 @@ def valid(scale, model, testing_data_loader, args, device):
         else:
             im_label = cropped_gt_img
             im_pre = cropped_sr_img
-        # print(im_pre.shape)
-        # print(im_label.shape)
         avg_psnr += utils.compute_psnr(im_pre, im_label)
         avg_ssim += utils.compute_ssim(im_pre, im_label)
-    print("===> Valid. psnr: {:.4f}, ssim: {:.4f}".format(avg_psnr / len(testing_data_loader), avg_ssim / len(testing_data_loader)))
+        if freq_eval is not None and freq_rows is not None:
+            freq_rows.append(freq_eval(cropped_sr_img, cropped_gt_img))
+    return avg_psnr / len(loader), avg_ssim / len(loader)
+
+
+def valid(scale, model, loaders, args, device, epochs_trained=0, freq_eval=None, extras=None):
+    """Validate on one DataLoader or a {name: DataLoader} dict; print and return the scores.
+
+    With several sets, prints one '===> Valid[name] ...' line per set, then the
+    '===> Valid. psnr/ssim' line (the one experiments.py parses) holding the mean over the sets.
+    Returns {name: (psnr, ssim)}. With `freq_eval`, also prints a '===> Freq[name]' line per set and,
+    if `extras` is a dict, fills it with {name: mean frequency metrics}.
+    """
+    if not isinstance(loaders, dict):
+        loaders = {"val": loaders}
+    results = {}
+    for name, loader in loaders.items():
+        rows = [] if freq_eval is not None else None
+        results[name] = evaluate(scale, model, loader, args, device, freq_eval, rows)
+        if rows:
+            mean = metrics_freq.mean_metrics(rows)
+            print("===> Freq[{}] {} (weights after {} epochs)".format(
+                name, metrics_freq.summary_line(mean, freq_eval.wavelets), epochs_trained))
+            if extras is not None:
+                extras[name] = mean
+        if len(loaders) > 1:
+            print("===> Valid[{}] psnr: {:.4f}, ssim: {:.4f} (weights after {} epochs)".format(
+                name, results[name][0], results[name][1], epochs_trained))
+    psnr = sum(r[0] for r in results.values()) / len(results)
+    ssim = sum(r[1] for r in results.values()) / len(results)
+    print("===> Valid. psnr: {:.4f}, ssim: {:.4f} (weights after {} epochs)".format(psnr, ssim, epochs_trained))
+    return results
 
 
 def save_checkpoint(epoch, model, args):
     """Save the model weights to experiment/checkpoint_ESRT_x<scale>/epoch_<epoch>.pth."""
-    model_folder = "experiment/checkpoint_ESRT_x{}/".format(args.scale)
+    model_folder = args.save_dir or "experiment/checkpoint_ESRT_x{}{}/".format(args.scale, esrt.variant_tag(args))
+    model_folder = model_folder.rstrip("/") + "/"
     model_out_path = model_folder + "epoch_{}.pth".format(epoch)
     if not os.path.exists(model_folder):
         os.makedirs(model_folder)
@@ -198,7 +254,11 @@ def print_network(net):
 def main():
     args = parser.parse_args()
     print(args)
-    torch.backends.cudnn.benchmark = True  # autotune conv algorithms (fixed-size training patches)
+    args.use_amp = bool(args.cuda and torch.cuda.is_available() and not args.no_amp)
+    if args.val_every < 1:
+        parser.error("--val_every must be >= 1")
+    utils.enable_tf32(args.use_amp)
+    torch.backends.cudnn.benchmark = args.use_amp  # autotune conv algorithms (fixed-size training patches)
     # random seed
     seed = args.seed
     if seed is None:
@@ -213,26 +273,45 @@ def main():
     print("===> Loading datasets")
 
     # Training: random HR/LR patch pairs from DIV2K (see data/DIV2K.py).
-    # Validation: full Set5 images, paths relative to the working directory.
+    # Validation: full-size images from every --val_sets benchmark (default set14 + set5).
     trainset = DIV2K.div2k(args)
-    testset = Set5_val.DatasetFromFolderVal("Test_Datasets/Set5/",
-                                           "Test_Datasets/Set5_LR/x{}/".format(args.scale),
-                                           args.scale)
-    training_data_loader = DataLoader(dataset=trainset, num_workers=args.threads, batch_size=args.batch_size, shuffle=True, pin_memory=True, drop_last=True)
-    testing_data_loader = DataLoader(dataset=testset, num_workers=args.threads, batch_size=args.testBatchSize,
-                                     shuffle=False)
+    try:
+        val_names = benchmarks.parse_sets(args.val_sets)
+        val_loaders = {}
+        for name in val_names:
+            hr_dir, lr_dir = benchmarks.resolve(name, args.scale, args.bench_root)
+            val_loaders[name] = DataLoader(dataset=benchmarks.PairedVal(hr_dir, lr_dir, args.scale),
+                                           num_workers=args.threads, batch_size=args.testBatchSize,
+                                           shuffle=False, pin_memory=True, persistent_workers=args.threads > 0)
+    except (ValueError, FileNotFoundError) as e:
+        parser.error(str(e))
+    training_data_loader = DataLoader(dataset=trainset, num_workers=args.threads, batch_size=args.batch_size, shuffle=True, pin_memory=True, drop_last=True,
+                                     persistent_workers=args.threads > 0)
+
+    freq_eval = None
+    if args.hf_metrics:
+        try:
+            freq_eval = metrics_freq.FreqEvaluator.from_args(args, device if cuda else "cpu")
+        except ValueError as e:
+            parser.error(str(e))
 
     print("===> Building models")
     args.is_train = True
 
 
-    model = esrt.ESRT(upscale = args.scale)#architecture.IMDN(upscale=args.scale)
+    try:
+        model = esrt.ESRT(upscale = args.scale, **esrt.model_kwargs(args))
+    except ValueError as e:
+        parser.error(str(e))
+    #architecture.IMDN(upscale=args.scale)
 
     l1_criterion = nn.L1Loss()
 
     print("===> Setting GPU")
     if cuda:
         model = model.to(device)
+        if args.use_amp:
+            model = model.to(memory_format=torch.channels_last)
         l1_criterion = l1_criterion.to(device)
 
     # Optionally initialise from a checkpoint (supports DataParallel 'module.' prefixes).
@@ -263,7 +342,17 @@ def main():
 
     print("===> Setting Optimizer")
 
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = optim.Adam(model.parameters(), lr=args.lr, fused=bool(cuda and torch.cuda.is_available()))
+
+    # --fast: compile for training (checkpoints/validation keep using the plain `model`).
+    train_model = model
+    if args.fast and cuda:
+        lp = args.patch_size // args.scale
+        example = torch.rand(args.batch_size, 3, lp, lp, device=device)
+        if args.use_amp:
+            example = example.contiguous(memory_format=torch.channels_last)
+        train_model = utils.compile_model(model, example, train=True, autocast=args.use_amp,
+                                         mode=args.compile_mode)
 
 
 
@@ -271,14 +360,25 @@ def main():
     print_network(model)
     code_start = datetime.datetime.now()
     timer = utils.Timer()
+    save_dir = (args.save_dir or "experiment/checkpoint_ESRT_x{}{}/".format(args.scale, esrt.variant_tag(args))).rstrip("/")
+    plotter = plotting.TrainValPlotter(save_dir, title=os.path.basename(save_dir),
+                                       reference=plotting.load_reference(args.ref_history) if args.ref_history else None) if args.plot else None
     # Main loop. Note validation runs *before* training each epoch, so the reported
     # score lags the weights saved at the end of that epoch by one epoch.
     for epoch in range(args.start_epoch, args.nEpochs + 1):
         t_epoch_start = timer.t()
         epoch_start = datetime.datetime.now()
-        valid(args.scale, model, testing_data_loader, args, device)
-        train(epoch, model, optimizer, l1_criterion, training_data_loader, args, device)
-        if epoch%10==0:
+        if (epoch - args.start_epoch) % args.val_every == 0:
+            extras = {}
+            res = valid(args.scale, model, val_loaders, args, device, epoch - 1, freq_eval, extras)
+            if plotter:
+                plotter.add_val(epoch - 1, res)
+                plotter.add_freq(epoch - 1, extras)
+                plotter.save()
+        loss = train(epoch, train_model, optimizer, l1_criterion, training_data_loader, args, device)
+        if plotter:
+            plotter.add_loss(epoch, loss)
+        if epoch%10==0 or epoch == args.nEpochs:  # always keep the final epoch
             save_checkpoint(epoch, model, args)
         epoch_end = datetime.datetime.now()
         print('Epoch cost times: %s' % str(epoch_end-epoch_start))
@@ -289,6 +389,13 @@ def main():
         t_epoch = utils.time_text(t - t_epoch_start)
         t_elapsed, t_all = utils.time_text(t), utils.time_text(t / prog)
         print('{} {}/{}'.format(t_epoch, t_elapsed, t_all))
+    extras = {}
+    res = valid(args.scale, model, val_loaders, args, device, args.nEpochs, freq_eval, extras)  # score the final weights
+    if plotter:
+        plotter.add_val(args.nEpochs, res)
+        plotter.add_freq(args.nEpochs, extras)
+        plotter.save()
+        print("===> Training curves saved to {}/curves.png".format(save_dir))
     code_end = datetime.datetime.now()
     print('Code cost times: %s' % str(code_end-code_start))
 

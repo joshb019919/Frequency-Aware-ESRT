@@ -77,22 +77,39 @@ def main():
     p.add_argument("--iters", type=int, default=20)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--seed", type=int, default=1)
+    from model import esrt as _esrt
+    import utils
+    _esrt.add_model_args(p)
+    utils.add_fast_arg(p)
+    p.add_argument('--no_amp', action='store_true', help='plain fp32 (no bf16 autocast / channels_last / cudnn.benchmark)')
     p.add_argument("--json", default=None, help="write results to this file")
     a = p.parse_args()
 
     torch.manual_seed(a.seed)
     dev = torch.device(a.device)
-    model = load_esrt(a.model_file)(upscale=a.scale).to(dev)
-    res = {"model_file": a.model_file or "model/esrt.py", "scale": a.scale, "device": str(dev),
+    try:
+        model = load_esrt(a.model_file)(upscale=a.scale, **_esrt.model_kwargs(a)).to(dev)
+    except ValueError as e:
+        p.error(str(e))
+    amp = dev.type == 'cuda' and not a.no_amp
+    utils.enable_tf32(amp)
+    torch.backends.cudnn.benchmark = amp
+    if amp:
+        model = model.to(memory_format=torch.channels_last)
+    cl = torch.channels_last if amp else torch.contiguous_format
+    res = {"amp_channels_last": amp, "fast": a.fast, "model_file": a.model_file or "model/esrt.py", "scale": a.scale, "freq": a.freq, "conv": a.conv, "global_res": a.global_res, "device": str(dev),
            "params": sum(x.numel() for x in model.parameters())}
 
     # Inference latency (batch 1, fixed LR size)
     model.eval()
-    x = torch.rand(1, 3, *a.lr_size, device=dev)
+    x = torch.rand(1, 3, *a.lr_size, device=dev).contiguous(memory_format=cl)
+    infer_model = model
+    if a.fast and dev.type == 'cuda':
+        infer_model = utils.compile_model(model, x, autocast=True, mode=a.compile_mode)
     if dev.type == "cuda":
         torch.cuda.reset_peak_memory_stats()
-    with torch.no_grad():
-        res["inference"] = timeit(lambda: model(x), dev, a.warmup, a.iters)
+    with torch.inference_mode(), torch.autocast('cuda', dtype=torch.bfloat16, enabled=bool(a.fast and dev.type == 'cuda')):
+        res["inference"] = timeit(lambda: infer_model(x), dev, a.warmup, a.iters)
     res["inference"]["lr_size"] = a.lr_size
     if dev.type == "cuda":
         res["inference"]["peak_mem_mb"] = torch.cuda.max_memory_allocated() / 2**20
@@ -100,15 +117,20 @@ def main():
     # One training step (forward + L1 + backward + Adam)
     model.train()
     lr_p = a.patch_size // a.scale  # LR patch size matching the HR patch
-    xb = torch.rand(a.batch_size, 3, lr_p, lr_p, device=dev)
+    xb = torch.rand(a.batch_size, 3, lr_p, lr_p, device=dev).contiguous(memory_format=cl)
     yb = torch.rand(a.batch_size, 3, lr_p * a.scale, lr_p * a.scale, device=dev)
-    opt = torch.optim.Adam(model.parameters(), lr=2e-4)
+    opt = torch.optim.Adam(model.parameters(), lr=2e-4, fused=dev.type == 'cuda')
+    train_model = model
+    if a.fast and dev.type == 'cuda':
+        train_model = utils.compile_model(model, xb, train=True, autocast=amp, mode=a.compile_mode)
     crit = nn.L1Loss()
 
     def step():
         """A single optimisation step on the fixed random batch."""
-        opt.zero_grad()
-        crit(model(xb), yb).backward()
+        opt.zero_grad(set_to_none=True)
+        with torch.autocast('cuda', dtype=torch.bfloat16, enabled=amp):
+            out = train_model(xb)
+        crit(out.float(), yb).backward()
         opt.step()
 
     if dev.type == "cuda":

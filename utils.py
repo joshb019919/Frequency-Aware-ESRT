@@ -8,6 +8,7 @@ newer version use skimage.metrics.peak_signal_noise_ratio / structural_similarit
 """
 from skimage.metrics import peak_signal_noise_ratio as psnr
 from skimage.metrics import structural_similarity as ssim
+import argparse
 import numpy as np
 import os
 import torch
@@ -80,6 +81,17 @@ def get_list(path, ext):
     return [os.path.join(path, f) for f in os.listdir(path) if f.endswith(ext)]
 
 
+def detect_image_ext(path, candidates=('.png', '.bmp')):
+    """Return the first extension in `candidates` that has files in directory `path`.
+
+    Raises FileNotFoundError (instead of silently yielding an empty list) when none match.
+    """
+    for ext in candidates:
+        if get_list(path, ext):
+            return ext
+    raise FileNotFoundError("no {} images found in {}".format(" or ".join(candidates), path))
+
+
 def convert_shape(img):
     """Convert a CHW float image in [0,1] to an HWC uint8 image in [0,255]."""
     img = np.transpose((img * 255.0).round(), (1, 2, 0))
@@ -132,3 +144,72 @@ def load_state_dict(path):
             name = k
         new_state_dcit[name] = v
     return new_state_dcit
+
+
+def add_fast_arg(parser):
+    """Add --fast/--no-fast (default on): torch.compile + bf16 autocast + TF32 for fp32 ops."""
+    parser.add_argument('--fast', action=argparse.BooleanOptionalAction, default=True,
+                        help='torch.compile the model, use bf16 autocast for inference and TF32 for '
+                             'ops that stay fp32 (default on; --no-fast gives plain eager fp32; '
+                             'training uses bf16 AMP unless --no_amp)')
+    parser.add_argument('--compile_mode', default='default',
+                        choices=['default', 'reduce-overhead', 'max-autotune', 'max-autotune-no-cudagraphs'],
+                        help='torch.compile mode when --fast is on (default is plain inductor; reduce-overhead = CUDA graphs)')
+
+
+def enable_tf32(enabled=True):
+    """Let fp32 matmuls/convs use TF32 tensor cores (Ampere+). Composes with bf16 autocast:
+    autocast runs eligible ops in bf16, everything left in fp32 (loss, norms, non-autocast
+    code) gets TF32. Harmless on GPUs without TF32 support."""
+    if enabled and torch.cuda.is_available():
+        torch.set_float32_matmul_precision('high')
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+
+class _CloneOutput(torch.nn.Module):
+    """Wrap a CUDA-graph-compiled module so each call returns a fresh tensor.
+
+    Without this, calling the model again with the same shape overwrites earlier outputs
+    (forward_chop keeps four tile outputs alive before stitching them).
+    """
+    def __init__(self, compiled):
+        super().__init__()
+        self.compiled = compiled
+
+    def forward(self, x):
+        return self.compiled(x).clone()
+
+
+def compile_model(model, example, train=False, autocast=False, dynamic=None, backend='inductor',
+                  mode='default'):
+    """torch.compile `model`, forcing the real compile with `example` now.
+
+    mode defaults to 'default'. 'reduce-overhead' (CUDA graphs) removes kernel-launch overhead
+    but measured only ~4% faster here (GPU-bound) for ~40 s more compile; its outputs are
+    overwritten by the next call, so consume/copy them before calling again.
+
+    Falls back to the original eager model (with a warning) if compilation fails, e.g.
+    inductor needs the Python development headers and a C compiler. With train=True the
+    warm-up runs forward+backward so the training graph is compiled too; gradients are
+    cleared afterwards (no optimizer step).
+    """
+    import torch
+    try:
+        cm = torch.compile(model, backend=backend, dynamic=dynamic, mode=mode)
+        if not train and mode in ('reduce-overhead', 'max-autotune'):
+            cm = _CloneOutput(cm)  # CUDA-graph outputs are reused by the next call
+        with torch.autocast('cuda', dtype=torch.bfloat16, enabled=autocast):
+            if train:
+                cm(example).float().mean().backward()
+                model.zero_grad(set_to_none=True)
+            else:
+                with torch.inference_mode():
+                    cm(example)
+        return cm
+    except Exception as e:  # compile errors surface lazily, at the first call
+        print("[--fast] torch.compile unavailable, continuing eager: {}: {}".format(
+            type(e).__name__, str(e).splitlines()[0][:200]))
+        torch._dynamo.reset()
+        model.zero_grad(set_to_none=True)
+        return model
