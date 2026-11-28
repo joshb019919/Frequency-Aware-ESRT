@@ -16,6 +16,23 @@ L = ‖SR − HR‖₁ + λ · ‖FFT(SR) − FFT(HR)‖₁
 
 Configs train **one per GPU in parallel**. GPUs are detected automatically, so two GPUs make each phase about 14 h. All commands run from the repo root.
 
+
+## Quick start (after setup)
+
+```bash
+cd ~/Frequency-Aware-ESRT && source .venv/bin/activate && git pull
+scripts/run_fft_experiments.sh sweep        # FFT loss, λ = 0.01 / 0.05 / 0.1
+scripts/run_fft_experiments.sh dwt          # DWT + FFT, best λ of the sweep picked automatically
+scripts/run_window_experiments.sh           # every window combination that can run yet (run again after the sweep)
+```
+
+These need no settings. The choices are fixed once at the top of `scripts/lib_experiments.sh`:
+- `DEFAULT_GPUS=1` (GPU 1; `0,1` uses both)
+- `DEFAULT_DWT_CONFIG=dwt_cband_gr1_skipnorm`
+- `SWEEP_LAMBDAS=0.01,0.05,0.1`
+
+Every command can be re-run at any time: finished configs are skipped, and configs still training are not started twice. `LAMBDA=`, `DWT_CONFIG=`, `GPUS=` and `CONFIGS=` still override the defaults for one run.
+
 ## 1. Clone and create the venv
 
 ```bash

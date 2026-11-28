@@ -1,22 +1,21 @@
 #!/usr/bin/env bash
 # Window-attention experiments (proposal stretch goal V4 + the full window ablation), separate from the FFT runs.
 #
-# The configs are built from what you have decided so far; each adds window attention (--attn window,
-# util/transformer.WindowAttention) on top of the other changes:
+# Trains every window-attention combination that can run yet (window attention: --attn window,
+# util/transformer.WindowAttention), with no settings needed:
 #
-#   (nothing set)          lowpass_win                     window                      needs no other result
-#   DWT_CONFIG=<dwt>       + <dwt>_win                     DWT + window
-#   LAMBDA=<l>             + lowpass_fl<l>_win             FFT + window
-#   both                   + <dwt>_fl<l>_win               DWT + FFT + window (V4)
+#   lowpass_win                  window
+#   <dwt>_win                    DWT + window                  <dwt> = DEFAULT_DWT_CONFIG in lib_experiments.sh
+#   lowpass_fl<l>_win            FFT + window                  only once the FFT sweep has finished:
+#   <dwt>_fl<l>_win              DWT + FFT + window (V4)       <l> = its best lambda, picked automatically
 #
-#   scripts/run_window_experiments.sh
-#   LAMBDA=0.05 DWT_CONFIG=dwt_c3_gr1_skipnorm scripts/run_window_experiments.sh   # all four window rows
-#   CONFIGS="dwt_c3_gr1_skipnorm_fl0.05_win" LAMBDA=0.05 DWT_CONFIG=dwt_c3_gr1_skipnorm scripts/run_window_experiments.sh
-#                                                                                   # only the named config(s)
-# Finished configs are always skipped, so running again with more set only trains what is new.
+#   scripts/run_window_experiments.sh                 # run it now, and again after the sweep for the FFT ones
+#
+# Finished configs are skipped and configs still training (in any run folder) are not started twice, so you
+# can simply run it again at any time. Overrides: LAMBDA=, DWT_CONFIG=, CONFIGS="name ..." (only those).
 #
 # Same training settings as every other run (x2, patch 96, 1000 epochs, seed 1, --fast, bf16), one config per
-# GPU in parallel (GPUs auto-detected; e.g. GPUS=1 to use only GPU 1), then tests on Set5 / Set14 / BSDS300 /
+# GPU (GPU 1 by default: DEFAULT_GPUS in lib_experiments.sh), then tests on Set5 / Set14 / BSDS300 /
 # Manga109, packaging into final_results/<config>/ and the summary table. ~7 h per config.
 # Own run folders, experiment/run_window_gpu<N>/ (RUN=run_window): it never shares files with
 # run_fft_experiments.sh, so both can run at the same time on different GPUs.
@@ -30,7 +29,9 @@ RUN=${RUN:-run_window}
 # shellcheck source=lib_experiments.sh
 . scripts/lib_experiments.sh
 
-LAMBDA=${LAMBDA:-}; DWT_CONFIG=${DWT_CONFIG:-}
+DWT_CONFIG=${DWT_CONFIG-$DEFAULT_DWT_CONFIG}   # DWT_CONFIG= (empty) leaves the DWT configs out
+LAMBDA=${LAMBDA:-$(best_lambda)}                # empty until the FFT sweep is finished
+[ -n "$LAMBDA" ] || echo "FFT sweep not finished yet: the FFT + window configs are left out (run this again later)"
 if [ -n "$DWT_CONFIG" ]; then
   case " $DWT_CONFIGS " in *" $DWT_CONFIG "*) ;; *) echo "DWT_CONFIG must be one of: $DWT_CONFIGS" >&2; exit 1 ;; esac
 fi

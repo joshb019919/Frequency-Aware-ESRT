@@ -8,8 +8,9 @@
 #              - data check: re-tests final_results/lowpass on this machine's Set5/BSDS300/Manga109 (fast and
 #                no-fast) and compares per image with the committed results, so you know the new data and
 #                test mode reproduce them (records which TEST_FAST setting to use)
-#   sweep      V1 + lambda study: lowpass trained with lambda in $LAMBDAS (default 0.01,0.05,0.1)
-#   dwt        V3: the three DWT configs trained with one lambda ($LAMBDA)
+#   sweep      V1 + lambda study: lowpass trained with each lambda in SWEEP_LAMBDAS (lib_experiments.sh)
+#   dwt        V3: the three DWT configs trained with the sweep's best lambda (picked automatically; LAMBDA=
+#              overrides it)
 #              Each phase is 3 configs of ~7 h, trained one per GPU in parallel (2 GPUs: ~14 h, 3+: ~7 h).
 #              Worker run folders: experiment/run_fft_gpu<N>/ (one experiments.py per GPU).
 #
@@ -22,7 +23,8 @@
 # Usage (repo root, GPU machine):
 #   scripts/run_fft_experiments.sh baselines
 #   scripts/run_fft_experiments.sh sweep
-#   LAMBDA=0.05 scripts/run_fft_experiments.sh dwt
+#   scripts/run_fft_experiments.sh dwt
+# GPU, lambdas and DWT variant are set once at the top of scripts/lib_experiments.sh (default: GPU 1).
 # Env: RUN (run id, default run_fft) and everything listed in scripts/lib_experiments.sh (ROOT, BENCH, PY,
 #      EPOCHS, GPUS, TEST_FAST, DRY_RUN). Extra arguments after the phase are passed to experiments.py.
 set -euo pipefail
@@ -81,9 +83,11 @@ fi
 # ------------------------------------------------------------------------------------------- sweep / dwt
 NAMES=()
 case "$PHASE" in
-  sweep) LAMBDAS=${LAMBDAS:-0.01,0.05,0.1}
+  sweep) LAMBDAS=${LAMBDAS:-$SWEEP_LAMBDAS}
          for l in ${LAMBDAS//,/ }; do NAMES+=("lowpass_fl$(fmt_lambda "$l")"); done ;;
-  dwt)   LAMBDAS=${LAMBDA:?set LAMBDA to the best value from the sweep, e.g. LAMBDA=0.05}
+  dwt)   LAMBDAS=${LAMBDA:-$(best_lambda)}
+         [ -n "$LAMBDAS" ] || { echo "the sweep is not finished yet (no final_results/lowpass_fl* for every lambda); run it first, or set LAMBDA" >&2; exit 1; }
+         echo "lambda: $LAMBDAS${LAMBDA:+ (set by LAMBDA)}${LAMBDA:- (best of the sweep)}"
          for b in $DWT_CONFIGS; do NAMES+=("${b}_fl$(fmt_lambda "$LAMBDAS")"); done ;;
   *) echo "phase must be baselines, sweep or dwt (window attention: scripts/run_window_experiments.sh)" >&2; exit 1 ;;
 esac

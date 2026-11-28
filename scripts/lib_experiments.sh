@@ -11,6 +11,12 @@
 #      TEST_FAST (--fast | --no-fast for the Set14/BSDS300/Manga109 tests; default: what `baselines` found,
 #      else --fast), DRY_RUN=1 (print every command, run/copy nothing).
 
+# ------------------------------------------------------------------ settings: edit these
+DEFAULT_GPUS=1                         # GPU(s) to train on, e.g. 1 or 0,1 (falls back to the GPUs found if absent)
+DEFAULT_DWT_CONFIG=dwt_cband_gr1_skipnorm   # DWT variant used for the window runs (best average over the test sets)
+SWEEP_LAMBDAS=0.01,0.05,0.1            # the FFT-loss sweep; the best of these is picked automatically afterwards
+# -------------------------------------------------------------------------------------------
+
 ROOT=${ROOT:-div2k}
 BENCH=${BENCH:-.}
 # train.py validates on Set5 + Set14 and experiments.py cannot pass it a benchmark root, so the sets must be
@@ -28,13 +34,17 @@ if [ -z "${PY:-}" ]; then
   if [ -x .venv/bin/python ]; then PY=.venv/bin/python; else PY=python; fi
 fi
 EPOCHS=${EPOCHS:-1000}
-# GPUs used for parallel training (one config per GPU at a time): $GPUS, else $CUDA_VISIBLE_DEVICES,
-# else every GPU nvidia-smi lists, else just 0. One GPU simply means one worker.
+# GPUs used for training (one config per GPU at a time): $GPUS if set, else DEFAULT_GPUS when this machine
+# has them, else every GPU nvidia-smi lists, else 0. Several GPUs train several configs in parallel.
 if [ -z "${GPUS:-}" ]; then
-  if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then GPUS=$CUDA_VISIBLE_DEVICES
-  elif command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi --query-gpu=index --format=csv,noheader >/dev/null 2>&1; then
-    GPUS=$(nvidia-smi --query-gpu=index --format=csv,noheader | tr -d ' ' | paste -sd, -)
-  else GPUS=0; fi
+  found=""
+  if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi --query-gpu=index --format=csv,noheader >/dev/null 2>&1; then
+    found=$(nvidia-smi --query-gpu=index --format=csv,noheader | tr -d ' ' | paste -sd, -)
+  fi
+  GPUS=$DEFAULT_GPUS
+  for g in ${DEFAULT_GPUS//,/ }; do
+    case ",$found," in *",$g,"*) ;; *) GPUS=${found:-0}; break ;; esac
+  done
 fi
 SCALE=2
 DRY_RUN=${DRY_RUN:-0}
@@ -105,6 +115,41 @@ find_exp() {  # find_exp NAME: the worker run folder (of this $RUN) holding NAME
   return 0
 }
 
+still_training() {  # still_training NAME: a run folder (any experiment script) where NAME is mid-training, or empty
+  local d
+  for d in experiment/*_gpu*/exp_"$1"; do
+    [ -f "$d/train.log" ] && [ ! -f "$d/epoch_$EPOCHS.pth" ] || continue
+    # train.log is written every epoch (~25 s); untouched for 15 min means the run died.
+    if [ -n "$(find "$d/train.log" -mmin -15 2>/dev/null)" ]; then echo "$d"; return 0; fi
+  done
+  return 0
+}
+
+best_lambda() {  # λ from SWEEP_LAMBDAS with the best mean PSNR gain over lowpass, once the whole sweep is packaged
+  "$PY" - "$SWEEP_LAMBDAS" <<'PYEOF'
+import json, os, sys
+lams = [float(x) for x in sys.argv[1].split(",") if x.strip()]
+def mean_psnr(cfg, sub):
+    p = os.path.join("final_results", cfg, sub, "test_x2_summary.json")
+    if not os.path.exists(p):
+        return None
+    (_, v), = json.load(open(p)).items()
+    return sum(v["psnr"]) / len(v["psnr"])
+sets = ["", "set14", "bsds300", "manga109"]
+cands = {l: "lowpass_fl{:g}".format(l) for l in lams}
+# use the test sets that every sweep config and lowpass have, so the comparison is like for like
+usable = [s for s in sets if all(mean_psnr(c, s) is not None for c in list(cands.values()) + ["lowpass"])]
+if not usable:
+    sys.exit(0)  # sweep not finished/packaged yet
+gain = {l: sum(mean_psnr(c, s) - mean_psnr("lowpass", s) for s in usable) / len(usable) for l, c in cands.items()}
+best = max(gain, key=gain.get)
+print("{:g}".format(best))
+for l in lams:
+    print("  lambda {:g}: mean PSNR gain over lowpass {:+.4f} dB ({}){}".format(
+        l, gain[l], ", ".join(s or "set5" for s in usable), "  <- best" if l == best else ""), file=sys.stderr)
+PYEOF
+}
+
 # train_parallel EXPERIMENTS_ARGS...: train every config in NAMES that is not finished yet, spread round-robin
 # over $GPUS; each GPU runs its own experiments.py with its own run id ($RUN_gpu<N>), so no two processes
 # ever share a folder or a CSV. EXPERIMENTS_ARGS (e.g. --freq_lambdas 0.05 --window) select the config
@@ -116,7 +161,9 @@ train_parallel() {
   IFS=, read -ra gpu_list <<< "$GPUS"
   todo=()
   for name in "${NAMES[@]}"; do
-    if [ -n "$(find_exp "$name")" ]; then echo "[$name] already trained in $(find_exp "$name")"; else todo+=("$name"); fi
+    if [ -n "$(find_exp "$name")" ]; then echo "[$name] already trained in $(find_exp "$name")"
+    elif [ -n "$(still_training "$name")" ]; then echo "[$name] still training in $(still_training "$name"), not started again"
+    else todo+=("$name"); fi
   done
   echo "GPUs: ${gpu_list[*]}  |  configs to train: ${todo[*]:-none}"
   pids=(); logs=()
