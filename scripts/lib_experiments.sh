@@ -134,7 +134,10 @@ train_parallel() {
     echo "GPU $g -> $only   (run folder experiment/$wrun, log $log)"
     if [ "$DRY_RUN" = 1 ]; then CUDA_VISIBLE_DEVICES=$g "${cmd[@]}" --dry_run | sed 's/^/    /'; continue; fi
     mkdir -p "experiment/$wrun"
-    CUDA_VISIBLE_DEVICES=$g "${cmd[@]}" > "$log" 2>&1 &
+    # Appended, not overwritten: a later phase reusing this worker folder keeps the earlier history.
+    printf '\n===== %s  %s  GPU %s  configs: %s  (git %s)\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$(basename "$0")" \
+      "$g" "$only" "$(git rev-parse --short HEAD 2>/dev/null || echo '?')" >> "$log"
+    CUDA_VISIBLE_DEVICES=$g "${cmd[@]}" >> "$log" 2>&1 &
     pids+=($!); logs+=("$log")
   done
   if [ ${#pids[@]} -gt 0 ]; then
@@ -172,8 +175,44 @@ test_and_package() {
     for set in $TEST_SETS; do
       if [ -d "$exp/$set" ]; then mkdir -p "$out/$set"; cp "$exp/$set/"* "$out/$set/"; fi
     done
+    write_run_info "$name" "$exp" "$out"
     echo "[$name] packaged into $out"
   done
+}
+
+# write_run_info NAME EXP_DIR OUT_DIR: OUT_DIR/run_info.json records how this result was produced, so a
+# final_results/<config>/ folder stays traceable on its own (config, flags, lambda, attention, run folder,
+# GPU, test mode, git commit, when training ended / it was packaged, and the files it contains).
+# When each phase started is in the dated headers of experiment/<worker>/worker.log.
+write_run_info() {
+  local name=$1 exp=$2 out=$3
+  NAME="$name" EXP="$exp" OUT="$out" FLAGS="$(flags_for "$name")" MODE="$TEST_FAST" RUN_ID="$RUN" \
+  EPOCHS="$EPOCHS" GIT="$(git rev-parse HEAD 2>/dev/null || echo unknown)" "$PY" - <<'PYEOF'
+import glob, json, os, re, time
+e = os.environ
+name, exp = e["NAME"], e["EXP"]
+lam = re.search(r"_fl([\d.e+-]+)(?:_win)?$", name)
+wrun = os.path.basename(os.path.dirname(exp))
+log = os.path.join(exp, "train.log")
+info = {
+    "config": name,
+    "model_flags": e["FLAGS"].split(),
+    "freq_loss_lambda": float(lam.group(1)) if lam else 0.0,
+    "attention": "window" if name.endswith("_win") else "split",
+    "epochs": int(e["EPOCHS"]),
+    "run_folder": exp,
+    "worker": wrun,
+    "gpu": wrun.rsplit("_gpu", 1)[1] if "_gpu" in wrun else None,
+    "run_id": e["RUN_ID"],
+    "test_mode": e["MODE"],
+    "git_commit_at_packaging": e["GIT"],
+    "train_log_modified": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(os.path.getmtime(log))) if os.path.exists(log) else None,
+    "packaged": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    "files": sorted(os.path.relpath(p, e["OUT"]) for p in glob.glob(os.path.join(e["OUT"], "**", "*"), recursive=True)
+                    if os.path.isfile(p) and not p.endswith("run_info.json")),
+}
+json.dump(info, open(os.path.join(e["OUT"], "run_info.json"), "w"), indent=2)
+PYEOF
 }
 
 summarize() {
